@@ -84,7 +84,13 @@
 #define NGX_CACHE_PURGE_INDEX_FAILED         4   /* zone too small: walk */
 
 #define NGX_CACHE_PURGE_INDEX_PATHS          32     /* cache zones */
-#define NGX_CACHE_PURGE_INDEX_BATCH          256    /* build: files per lock */
+#define NGX_CACHE_PURGE_INDEX_BATCH          1024   /* build: reads at once */
+#define NGX_CACHE_PURGE_INDEX_CHUNK          256    /* build: files per lock */
+
+/* build units (see build_init) */
+#define NGX_CACHE_PURGE_UNIT_TODO            0
+#define NGX_CACHE_PURGE_UNIT_DONE            (-1)
+#define NGX_CACHE_PURGE_UNIT_NONE            ((ngx_uint_t) -1)
 #define NGX_CACHE_PURGE_INDEX_SLICE          1024   /* reconcile: per lock */
 #define NGX_CACHE_PURGE_INDEX_SYNC_LIMIT     1024
 #define NGX_CACHE_PURGE_INDEX_TAKE           64     /* entries per lock */
@@ -319,6 +325,15 @@ typedef struct {
     u_char                  key[1];         /* lowercased, no NUL */
 } ngx_http_cache_purge_index_node_t;
 
+/* A cache zone's share of a build: units first .. first + count - 1 */
+typedef struct {
+    ngx_rbtree_key_t        id;
+    ngx_uint_t              first;
+    ngx_uint_t              count;
+    ngx_uint_t              l0;             /* levels= lengths */
+    ngx_uint_t              l1;
+} ngx_http_cache_purge_build_cache_t;
+
 typedef struct ngx_http_cache_purge_index_sh_s {
     ngx_rbtree_t            rbtree;
     ngx_rbtree_node_t       sentinel;
@@ -334,6 +349,18 @@ typedef struct ngx_http_cache_purge_index_sh_s {
     ngx_rbtree_t            build;
     ngx_rbtree_node_t       build_sentinel;
     ngx_uint_t              nbuild;
+
+    /* the running build: its units and who walks them (see build_init) */
+    ngx_http_cache_purge_build_cache_t  build_caches[NGX_CACHE_PURGE_INDEX_PATHS];
+    ngx_uint_t              build_ncaches;
+    ngx_pid_t              *build_claims;   /* per unit: TODO, DONE or pid */
+    ngx_uint_t              build_units;
+    ngx_uint_t              build_next;
+    ngx_uint_t              build_done;
+    ngx_uint_t              build_files;
+    ngx_uint_t              build_deleted;
+    ngx_msec_t              build_started;
+    ngx_uint_t              build_seq;
     ngx_uint_t              busy;           /* see queue_lock */
     ngx_uint_t              generation;     /* bumped by every reset */
     ngx_msec_t              failed_at;
@@ -345,17 +372,14 @@ typedef struct {
     ngx_str_t               key;            /* to put it back if needed */
 } ngx_http_cache_purge_index_hit_t;
 
+/* A worker's part in a build: the unit it walks */
 typedef struct {
-    ngx_pool_t                       *pool;       /* NULL: not running */
+    ngx_uint_t                        unit;       /* or UNIT_NONE */
     ngx_uint_t                        generation; /* of the index */
-    ngx_array_t                       caches;     /* file cache pointers */
-    ngx_uint_t                        next_cache;
-    ngx_http_file_cache_t            *cache;      /* being walked */
+    ngx_uint_t                        seq;        /* of the build */
+    ngx_http_file_cache_t            *cache;
     ngx_rbtree_key_t                  id;
     ngx_http_cache_purge_scan_t       scan;
-    ngx_uint_t                        files;
-    ngx_uint_t                        deleted;
-    ngx_msec_t                        started;
 } ngx_http_cache_purge_build_t;
 
 typedef struct {
@@ -437,6 +461,9 @@ static ngx_int_t ngx_http_cache_purge_index_pass(
 static ngx_int_t ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
     ngx_http_cache_purge_main_conf_t *cmcf);
 static void ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b);
+static void ngx_http_cache_purge_build_release(
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_http_cache_purge_build_t *b);
+static void ngx_http_cache_purge_build_tick(ngx_event_t *ev);
 static ngx_http_file_cache_node_t *ngx_http_cache_purge_lookup_node(
     ngx_http_file_cache_t *cache, u_char *key16);
 static ngx_int_t ngx_http_cache_purge_filter_init(ngx_conf_t *cf);
@@ -689,6 +716,8 @@ static ngx_event_t                        ngx_cache_purge_event;
 static ngx_http_cache_purge_main_conf_t  *ngx_cache_purge_main_conf;
 static ngx_http_cache_purge_pass_t        ngx_cache_purge_pass;
 static ngx_http_cache_purge_build_t       ngx_cache_purge_build;
+static ngx_event_t                        ngx_cache_purge_build_event;
+static ngx_http_cache_purge_main_conf_t  *ngx_cache_purge_build_conf;
 static ngx_http_cache_purge_reconcile_t   ngx_cache_purge_reconcile;
 
 
@@ -1048,6 +1077,23 @@ ngx_http_cache_purge_init_worker(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+    /* every worker walks a share of an index build (build_tick) */
+    if (cmcf->index_zone != NULL
+        && (ngx_process == NGX_PROCESS_WORKER
+            || ngx_process == NGX_PROCESS_SINGLE))
+    {
+        ngx_cache_purge_build_conf = cmcf;
+        ngx_cache_purge_build.unit = NGX_CACHE_PURGE_UNIT_NONE;
+
+        ngx_memzero(&ngx_cache_purge_build_event, sizeof(ngx_event_t));
+        ngx_cache_purge_build_event.handler    = ngx_http_cache_purge_build_tick;
+        ngx_cache_purge_build_event.log        = cycle->log;
+        ngx_cache_purge_build_event.data       = cycle;
+        ngx_cache_purge_build_event.cancelable = 1;
+
+        ngx_add_timer(&ngx_cache_purge_build_event, cmcf->throttle_ms);
+    }
+
     /*
      * One drainer for the whole shared queue: worker 0.  Parallel walks of
      * the same tree only contend on dentry/inode locks and multiply the sys
@@ -1099,8 +1145,15 @@ ngx_http_cache_purge_exit_worker(ngx_cycle_t *cycle)
         ngx_del_timer(&ngx_cache_purge_event);
     }
 
-    /* an unfinished build walk is restarted by the next worker 0 */
-    ngx_http_cache_purge_build_end(&ngx_cache_purge_build);
+    /* the unit this worker was walking goes to another one */
+    if (ngx_cache_purge_build_event.timer_set) {
+        ngx_del_timer(&ngx_cache_purge_build_event);
+    }
+
+    if (ngx_cache_purge_build_conf != NULL) {
+        ngx_http_cache_purge_build_release(ngx_cache_purge_build_conf,
+                                           &ngx_cache_purge_build);
+    }
 
     if (pass->pool == NULL) {
         return;
@@ -2244,6 +2297,9 @@ ngx_http_cache_purge_scan_open(ngx_http_cache_purge_scan_t *s,
      * the copies made by enqueue both are */
     dir = opendir((const char *) root->data);
     if (dir == NULL) {
+        if (ngx_errno == NGX_ENOENT) {
+            return NGX_DECLINED;        /* levels= directories come lazily */
+        }
         ngx_log_error(NGX_LOG_CRIT, s->log, ngx_errno,
                       "ngx_cache_purge: opendir() \"%V\" failed", root);
         return NGX_ERROR;
@@ -3599,76 +3655,21 @@ ngx_http_cache_purge_index_pass(ngx_http_cache_purge_pass_t *pass,
 }
 
 
-/* -- key index: build walk and reconcile (worker 0 only) ------------------- */
+/* -- key index: build walk (all workers) and reconcile (worker 0) --------- */
 
-static void
-ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b)
-{
-    ngx_http_cache_purge_scan_close(&b->scan);
-
-    if (b->pool != NULL) {
-        ngx_destroy_pool(b->pool);
-    }
-
-    ngx_memzero(b, sizeof(ngx_http_cache_purge_build_t));
-}
-
-static ngx_int_t
-ngx_http_cache_purge_build_start(ngx_cycle_t *cycle,
-    ngx_http_cache_purge_build_t *b, ngx_uint_t generation)
-{
-    ngx_list_part_t         *part;
-    ngx_shm_zone_t          *zone;
-    ngx_http_file_cache_t   *cache, **pc;
-    ngx_uint_t               i;
-
-    ngx_memzero(b, sizeof(ngx_http_cache_purge_build_t));
-
-    b->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, cycle->log);
-    if (b->pool == NULL
-        || ngx_array_init(&b->caches, b->pool, 4,
-                          sizeof(ngx_http_file_cache_t *)) != NGX_OK)
-    {
-        ngx_http_cache_purge_build_end(b);
-        return NGX_ERROR;
-    }
-
-    part = &cycle->shared_memory.part;
-    zone = part->elts;
-
-    for (i = 0; /* void */ ; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            zone = part->elts;
-            i = 0;
-        }
-
-        cache = ngx_http_cache_purge_zone_cache(&zone[i]);
-
-        if (cache != NULL && cache->path != NULL) {
-            pc = ngx_array_push(&b->caches);
-            if (pc == NULL) {
-                ngx_http_cache_purge_build_end(b);
-                return NGX_ERROR;
-            }
-            *pc = cache;
-        }
-    }
-
-    b->scan.log   = cycle->log;
-    b->started    = ngx_current_msec;
-    b->generation = generation;
-
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "ngx_cache_purge: building the key index of %ui cache(s)",
-                  b->caches.nelts);
-
-    return NGX_OK;
-}
+/*
+ * The build walk, in parallel.
+ *
+ * The directories of every cache zone are cut into units -- one per
+ * directory at the second level of levels= (4096 per zone for levels=1:2),
+ * named after the level lengths, so no directory has to be listed to know
+ * them.  Every worker process claims units under the index lock and walks
+ * them in time slices (build_tick); the one that finishes the last unit
+ * declares the index ready.  A unit claimed by a process that died is
+ * handed out again (worker 0 looks for those), and a worker leaving on a
+ * reload hands its unit back.  Walking a unit twice is harmless: indexing
+ * is idempotent.
+ */
 
 static ngx_int_t
 ngx_http_cache_purge_unhex(u_char *p, u_char *md5)
@@ -3690,96 +3691,345 @@ ngx_http_cache_purge_unhex(u_char *p, u_char *md5)
     return NGX_OK;
 }
 
+static void
+ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b)
+{
+    ngx_http_cache_purge_scan_close(&b->scan);
+    b->unit = NGX_CACHE_PURGE_UNIT_NONE;
+}
+
+/* Hex digits of v, len of them (the name of a levels= directory) */
+static u_char *
+ngx_http_cache_purge_hex_level(u_char *p, ngx_uint_t v, size_t len)
+{
+    static u_char  hex[] = "0123456789abcdef";
+
+    while (len--) {
+        p[len] = hex[v & 0xf];
+        v >>= 4;
+    }
+
+    return p;
+}
+
 /*
- * One slice of the build walk.  Files are read in batches outside the lock;
- * each batch is then, under the lock, either indexed or (when a purge that
- * arrived during the build matches) deleted.  Checking and indexing under
- * the same lock the purges take is what makes "applied to the index so far
- * + remembered for the rest of the walk" exact.
- *
- * NGX_OK the build is complete, NGX_AGAIN budget ran out, NGX_DONE it was
- * abandoned (the index failed meanwhile).
+ * Plan a build over the caches of cycle: register their ids and unit ranges
+ * and a claim table, and enter BUILDING.  Locked.
  */
 static ngx_int_t
-ngx_http_cache_purge_build_step(ngx_http_cache_purge_main_conf_t *cmcf,
-    ngx_http_cache_purge_build_t *b, ngx_msec_t budget)
+ngx_http_cache_purge_build_init(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf)
 {
-    static u_char             keys[NGX_CACHE_PURGE_INDEX_BATCH]
-                                  [NGX_CACHE_PURGE_KEY_MAX_LEN];
-    static size_t             lens[NGX_CACHE_PURGE_INDEX_BATCH];
-    static u_char             md5s[NGX_CACHE_PURGE_INDEX_BATCH]
-                                  [NGX_HTTP_CACHE_KEY_LEN];
-    static u_char             del[NGX_CACHE_PURGE_INDEX_BATCH];
-    static int                fds[NGX_CACHE_PURGE_INDEX_BATCH];
-    ngx_http_file_cache_t   **caches;
-    ngx_str_t                 name;
-    ngx_uint_t                i, n, m;
-    ngx_int_t                 id, rc;
-    ngx_msec_t                start;
-    ngx_flag_t                failed, walked;
-    ssize_t                   len;
-    u_char                   *nl;
-    int                       dir_fd;
-    ngx_http_cache_purge_index_sh_t  *sh;
+    ngx_http_cache_purge_index_sh_t     *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_http_cache_purge_build_cache_t  *bc;
+    ngx_http_file_cache_t               *cache;
+    ngx_list_part_t                     *part;
+    ngx_shm_zone_t                      *zone;
+    ngx_uint_t                           i, units, n;
+    ngx_int_t                            id;
 
-    start  = ngx_current_msec;
-    caches = b->caches.elts;
+    if (sh->build_claims != NULL) {
+        ngx_slab_free_locked(cmcf->index_shpool, sh->build_claims);
+        sh->build_claims = NULL;
+    }
+
+    sh->build_ncaches = 0;
+    units = 0;
+
+    part = &cycle->shared_memory.part;
+    zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            zone = part->elts;
+            i = 0;
+        }
+
+        cache = ngx_http_cache_purge_zone_cache(&zone[i]);
+
+        if (cache == NULL || cache->path == NULL
+            || sh->build_ncaches == NGX_CACHE_PURGE_INDEX_PATHS)
+        {
+            continue;
+        }
+
+        id = ngx_http_cache_purge_index_cache_id(cmcf, &cache->path->name, 1);
+        if (id == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        bc = &sh->build_caches[sh->build_ncaches++];
+        bc->id    = (ngx_rbtree_key_t) id;
+        bc->first = units;
+        bc->l0    = cache->path->level[0];
+        bc->l1    = (bc->l0 != 0) ? cache->path->level[1] : 0;
+
+        n = (ngx_uint_t) 1 << (4 * (bc->l0 + bc->l1));
+        bc->count = n;
+        units += n;
+    }
+
+    if (units > 0) {
+        ngx_http_cache_purge_index_busy(sh, 1);
+        sh->build_claims = ngx_slab_calloc_locked(cmcf->index_shpool,
+                                                  units * sizeof(ngx_pid_t));
+        ngx_http_cache_purge_index_busy(sh, 0);
+
+        if (sh->build_claims == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    sh->build_units   = units;
+    sh->build_next    = 0;
+    sh->build_done    = 0;
+    sh->build_files   = 0;
+    sh->build_deleted = 0;
+    sh->build_started = ngx_current_msec;
+    sh->build_seq++;
+    sh->state = NGX_CACHE_PURGE_INDEX_BUILDING;
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "ngx_cache_purge: building the key index of %ui cache(s), "
+                  "%ui directories, in all workers", sh->build_ncaches,
+                  units);
+
+    return NGX_OK;
+}
+
+/* A unit to walk, or UNIT_NONE when all are claimed.  Locked. */
+static ngx_uint_t
+ngx_http_cache_purge_build_claim(ngx_http_cache_purge_index_sh_t *sh)
+{
+    ngx_uint_t  u;
+
+    while (sh->build_next < sh->build_units) {
+        u = sh->build_next++;
+        if (sh->build_claims[u] == NGX_CACHE_PURGE_UNIT_TODO) {
+            sh->build_claims[u] = ngx_pid;
+            return u;
+        }
+    }
+
+    /* units handed back by processes that left */
+    for (u = 0; u < sh->build_units; u++) {
+        if (sh->build_claims[u] == NGX_CACHE_PURGE_UNIT_TODO) {
+            sh->build_claims[u] = ngx_pid;
+            return u;
+        }
+    }
+
+    return NGX_CACHE_PURGE_UNIT_NONE;
+}
+
+/* Units claimed by processes that are gone go back to TODO.  Locked. */
+static void
+ngx_http_cache_purge_build_reclaim(ngx_http_cache_purge_index_sh_t *sh,
+    ngx_log_t *log)
+{
+    ngx_uint_t  u, n;
+    ngx_pid_t   pid;
+
+    n = 0;
+
+    for (u = 0; u < sh->build_units; u++) {
+        pid = sh->build_claims[u];
+
+        if (pid > 0 && kill(pid, 0) == -1 && ngx_errno == NGX_ESRCH) {
+            sh->build_claims[u] = NGX_CACHE_PURGE_UNIT_TODO;
+            n++;
+        }
+    }
+
+    if (n > 0) {
+        ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                      "ngx_cache_purge: %ui index build unit(s) of exited "
+                      "processes handed out again", n);
+    }
+}
+
+/* Directory of unit u into path; returns its cache's id.  Locked. */
+static ngx_int_t
+ngx_http_cache_purge_build_unit_path(ngx_http_cache_purge_index_sh_t *sh,
+    ngx_uint_t u, u_char *path, size_t size)
+{
+    ngx_http_cache_purge_build_cache_t  *bc;
+    ngx_str_t                           *root;
+    ngx_uint_t                           k, r;
+    u_char                              *p;
+
+    for (k = 0; k < sh->build_ncaches; k++) {
+        bc = &sh->build_caches[k];
+
+        if (u < bc->first || u >= bc->first + bc->count) {
+            continue;
+        }
+
+        root = &sh->paths[bc->id];
+
+        if (root->len + 1 + bc->l0 + 1 + bc->l1 + 1 > size) {
+            return NGX_ERROR;
+        }
+
+        r = u - bc->first;
+        p = ngx_cpymem(path, root->data, root->len);
+
+        if (bc->l0) {
+            *p++ = '/';
+            ngx_http_cache_purge_hex_level(p, r >> (4 * bc->l1), bc->l0);
+            p += bc->l0;
+        }
+
+        if (bc->l1) {
+            *p++ = '/';
+            ngx_http_cache_purge_hex_level(p, r & ((1 << (4 * bc->l1)) - 1),
+                                           bc->l1);
+            p += bc->l1;
+        }
+
+        *p = '\0';
+
+        return (ngx_int_t) bc->id;
+    }
+
+    return NGX_ERROR;
+}
+
+/*
+ * The last unit is done: the index is complete.  Locked.
+ */
+static void
+ngx_http_cache_purge_build_complete(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_log_t *log)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+
+    sh->state = NGX_CACHE_PURGE_INDEX_READY;
+    ngx_http_cache_purge_index_build_clear(cmcf);
+
+    if (sh->build_claims != NULL) {
+        ngx_http_cache_purge_index_busy(sh, 1);
+        ngx_slab_free_locked(cmcf->index_shpool, sh->build_claims);
+        sh->build_claims = NULL;
+        ngx_http_cache_purge_index_busy(sh, 0);
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                  "ngx_cache_purge: key index build complete: %ui file(s) "
+                  "read, %ui purged, %ui entries, in %Mms", sh->build_files,
+                  sh->build_deleted, sh->entries,
+                  ngx_current_msec - sh->build_started);
+}
+
+/*
+ * One slice of this worker's part of the build.  Files are read in batches
+ * outside the lock -- opened first, their header reads announced
+ * (POSIX_FADV_WILLNEED) so the kernel issues them together, then read --
+ * and then, in chunks under the lock, either indexed or (when a purge that
+ * arrived during the build covers them) deleted.  Checking and indexing
+ * under the lock the purges take is what makes "applied to the index so far
+ * + remembered for the rest of the walk" exact.
+ *
+ * NGX_AGAIN: budget ran out, more to do.  NGX_DONE: nothing (left) for this
+ * worker -- no build, all units claimed, or the build ended.
+ */
+static ngx_int_t
+ngx_http_cache_purge_build_step(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_http_cache_purge_build_t *b,
+    ngx_msec_t budget)
+{
+    static u_char                     keys[NGX_CACHE_PURGE_INDEX_BATCH]
+                                          [NGX_CACHE_PURGE_KEY_MAX_LEN];
+    static size_t                     lens[NGX_CACHE_PURGE_INDEX_BATCH];
+    static u_char                     md5s[NGX_CACHE_PURGE_INDEX_BATCH]
+                                          [NGX_HTTP_CACHE_KEY_LEN];
+    static u_char                     del[NGX_CACHE_PURGE_INDEX_BATCH];
+    static int                        fds[NGX_CACHE_PURGE_INDEX_BATCH];
+    ngx_http_cache_purge_index_sh_t  *sh;
+    ngx_str_t                         name, path;
+    ngx_uint_t                        i, n, m, c, end, deleted;
+    ngx_int_t                         id, rc;
+    ngx_msec_t                        start;
+    ngx_flag_t                        walked, stop;
+    ssize_t                           len;
+    u_char                           *nl, dir[NGX_MAX_PATH];
+    int                               dir_fd;
+
+    start = ngx_current_msec;
 
     for ( ;; ) {
 
-        if (b->cache == NULL) {
+        if (b->unit == NGX_CACHE_PURGE_UNIT_NONE) {
 
-            if (b->next_cache == b->caches.nelts) {
-                return NGX_OK;
+            sh = ngx_http_cache_purge_index_peek(cmcf);
+            if (sh == NULL || sh->state != NGX_CACHE_PURGE_INDEX_BUILDING) {
+                return NGX_DONE;                          /* a hint */
             }
-
-            b->cache = caches[b->next_cache++];
-
-            /*
-             * A cache directory that cannot be listed cannot be indexed:
-             * the index would claim to be complete without its files.
-             */
-            rc = ngx_http_cache_purge_scan_open(&b->scan,
-                                                &b->cache->path->name);
 
             sh = ngx_http_cache_purge_index_lock(cmcf);
 
-            if (sh == NULL || sh->generation != b->generation) {
+            if (sh == NULL || sh->state != NGX_CACHE_PURGE_INDEX_BUILDING
+                || ngx_exiting)
+            {
                 ngx_http_cache_purge_index_unlock(cmcf);
                 return NGX_DONE;
             }
 
-            id = (rc == NGX_OK)
-                 ? ngx_http_cache_purge_index_cache_id(cmcf,
-                                                  &b->cache->path->name, 1)
-                 : NGX_ERROR;
+            b->generation = sh->generation;
+            b->seq        = sh->build_seq;
+            b->unit       = ngx_http_cache_purge_build_claim(sh);
 
-            if (id == NGX_ERROR) {
-                ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
-                                    (rc != NGX_OK)
-                                    ? "a cache directory could not be read"
-                                    : "cache_purge_index zone is full, "
-                                      "increase cache_purge_index");
+            id = NGX_ERROR;
+            if (b->unit != NGX_CACHE_PURGE_UNIT_NONE) {
+                id = ngx_http_cache_purge_build_unit_path(sh, b->unit, dir,
+                                                          sizeof(dir));
+                if (id != NGX_ERROR) {
+                    b->id = (ngx_rbtree_key_t) id;
+                    path.data = sh->paths[id].data;
+                    path.len  = sh->paths[id].len;
+                    b->cache = ngx_http_cache_purge_find_cache(cycle, &path);
+                }
             }
 
             ngx_http_cache_purge_index_unlock(cmcf);
 
-            if (id == NGX_ERROR) {
+            if (b->unit == NGX_CACHE_PURGE_UNIT_NONE) {
                 return NGX_DONE;
             }
 
-            b->id = (ngx_rbtree_key_t) id;
+            b->scan.log = cycle->log;
+            b->scan.errors = 0;
+            path.data = dir;
+            path.len  = ngx_strlen(dir);
+
+            /* a directory that does not exist has no files: done */
+            if (id == NGX_ERROR || b->cache == NULL
+                || ngx_http_cache_purge_scan_open(&b->scan, &path)
+                   == NGX_ERROR)
+            {
+                b->scan.errors++;
+            }
         }
 
-        /*
-         * Read a batch.  Opening it all first and announcing the header
-         * reads (POSIX_FADV_WILLNEED) lets the kernel issue them together:
-         * from a cold cache this walk would otherwise wait for one disk
-         * read at a time.
-         */
-        walked = 0;
+        /* read a batch */
 
-        for (m = 0; m < NGX_CACHE_PURGE_INDEX_BATCH; /* void */ ) {
+        walked = (b->scan.depth == 0);
+
+        for (m = 0; !walked && m < NGX_CACHE_PURGE_INDEX_BATCH; /* void */ ) {
+
+            /* the slice's budget holds within a batch too */
+            if (budget != 0 && m != 0 && m % NGX_CACHE_PURGE_INDEX_CHUNK == 0)
+            {
+                ngx_time_update();
+                if (ngx_current_msec - start >= budget) {
+                    break;
+                }
+            }
 
             if (ngx_http_cache_purge_scan_next(&b->scan, &dir_fd, &name)
                 != NGX_OK)
@@ -3829,68 +4079,105 @@ ngx_http_cache_purge_build_step(ngx_http_cache_purge_main_conf_t *cmcf,
             n++;
         }
 
-        /* index it, or delete what a purge during the build matches */
+        /*
+         * Index it, or delete what a purge during the build covers, in
+         * chunks: other workers' fills and purges wait for this lock.
+         */
+        stop = 0;
 
-        failed = 0;
+        for (c = 0; c < n || (c == 0 && n == 0); c = end) {
 
-        sh = ngx_http_cache_purge_index_lock(cmcf);
+            end = ngx_min(n, c + NGX_CACHE_PURGE_INDEX_CHUNK);
 
-        if (b->scan.errors != 0
-            && sh != NULL && sh->generation == b->generation)
-        {
-            /* files under a directory the walk could not read are unknown */
-            ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
-                                    "a cache directory could not be read");
-            ngx_http_cache_purge_index_unlock(cmcf);
-            return NGX_DONE;
-        }
+            sh = ngx_http_cache_purge_index_lock(cmcf);
 
-        if (sh == NULL
-            || sh->state != NGX_CACHE_PURGE_INDEX_BUILDING
-            || sh->generation != b->generation)
-        {
-            ngx_http_cache_purge_index_unlock(cmcf);
-            return NGX_DONE;
-        }
-
-        for (i = 0; i < n; i++) {
-
-            del[i] = ngx_http_cache_purge_index_build_match(sh, b->id,
-                                                            keys[i], lens[i]);
-            if (del[i]) {
-                continue;
+            if (sh == NULL || sh->state != NGX_CACHE_PURGE_INDEX_BUILDING
+                || sh->generation != b->generation
+                || sh->build_seq != b->seq)
+            {
+                ngx_http_cache_purge_index_unlock(cmcf);
+                ngx_http_cache_purge_build_end(b);
+                return NGX_DONE;
             }
 
-            rc = ngx_http_cache_purge_index_insert(cmcf, b->id, keys[i],
-                                                   lens[i], md5s[i]);
-            if (rc == NGX_ERROR) {
-                ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
-                                            "cache_purge_index zone is full, increase cache_purge_index");
-                failed = 1;
+            if (b->scan.errors != 0) {
+                /* files under a directory it could not read are unknown */
+                ngx_http_cache_purge_index_lost(cmcf, cycle->log,
+                                    "a cache directory could not be read");
+                ngx_http_cache_purge_index_unlock(cmcf);
+                ngx_http_cache_purge_build_end(b);
+                return NGX_DONE;
+            }
+
+            for (i = c; i < end; i++) {
+
+                del[i] = ngx_http_cache_purge_index_build_match(sh, b->id,
+                                                        keys[i], lens[i]);
+                if (del[i]) {
+                    continue;
+                }
+
+                rc = ngx_http_cache_purge_index_insert(cmcf, b->id, keys[i],
+                                                       lens[i], md5s[i]);
+                if (rc == NGX_ERROR) {
+                    ngx_http_cache_purge_index_lost(cmcf, cycle->log,
+                        "cache_purge_index zone is full, increase "
+                        "cache_purge_index");
+                    stop = 1;
+                    break;
+                }
+            }
+
+            sh->build_files += end - c;
+
+            ngx_http_cache_purge_index_unlock(cmcf);
+
+            if (stop) {
+                ngx_http_cache_purge_build_end(b);
+                return NGX_DONE;
+            }
+
+            if (n == 0) {
                 break;
             }
         }
 
-        ngx_http_cache_purge_index_unlock(cmcf);
-
-        if (failed) {
-            return NGX_DONE;
-        }
+        deleted = 0;
 
         for (i = 0; i < n; i++) {
             if (del[i]
                 && ngx_http_cache_purge_delete_md5(b->cache, md5s[i],
-                                                   b->scan.log) == NGX_OK)
+                                                   cycle->log) == NGX_OK)
             {
-                b->deleted++;
+                deleted++;
             }
         }
 
-        b->files += n;
+        if (walked || deleted) {
+            sh = ngx_http_cache_purge_index_lock(cmcf);
 
-        if (walked) {
-            ngx_http_cache_purge_scan_close(&b->scan);
-            b->cache = NULL;
+            if (sh != NULL && sh->state == NGX_CACHE_PURGE_INDEX_BUILDING
+                && sh->generation == b->generation
+                && sh->build_seq == b->seq)
+            {
+                sh->build_deleted += deleted;
+
+                if (walked
+                    && sh->build_claims[b->unit] != NGX_CACHE_PURGE_UNIT_DONE)
+                {
+                    sh->build_claims[b->unit] = NGX_CACHE_PURGE_UNIT_DONE;
+
+                    if (++sh->build_done == sh->build_units) {
+                        ngx_http_cache_purge_build_complete(cmcf, cycle->log);
+                    }
+                }
+            }
+
+            ngx_http_cache_purge_index_unlock(cmcf);
+
+            if (walked) {
+                ngx_http_cache_purge_build_end(b);
+            }
         }
 
         if (budget != 0) {
@@ -3901,6 +4188,49 @@ ngx_http_cache_purge_build_step(ngx_http_cache_purge_main_conf_t *cmcf,
             }
         }
     }
+}
+
+/* This worker leaves (reload, stop): hand its unit back.  */
+static void
+ngx_http_cache_purge_build_release(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_build_t *b)
+{
+    ngx_http_cache_purge_index_sh_t  *sh;
+
+    if (b->unit != NGX_CACHE_PURGE_UNIT_NONE && cmcf->index_shpool != NULL) {
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+
+        if (sh != NULL && sh->generation == b->generation
+            && sh->build_seq == b->seq && sh->build_claims != NULL
+            && b->unit < sh->build_units
+            && sh->build_claims[b->unit] == ngx_pid)
+        {
+            sh->build_claims[b->unit] = NGX_CACHE_PURGE_UNIT_TODO;
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+    }
+
+    ngx_http_cache_purge_build_end(b);
+}
+
+/* Every worker's build timer: walk units while a build runs. */
+static void
+ngx_http_cache_purge_build_tick(ngx_event_t *ev)
+{
+    ngx_http_cache_purge_main_conf_t  *cmcf = ngx_cache_purge_build_conf;
+    ngx_int_t                          rc;
+
+    if (cmcf == NULL || ngx_exiting) {
+        return;
+    }
+
+    rc = ngx_http_cache_purge_build_step((ngx_cycle_t *) ngx_cycle, cmcf,
+                                         &ngx_cache_purge_build,
+                                         cmcf->walk_budget);
+
+    /* between slices a short pause; without work a poll for a build */
+    ngx_add_timer(ev, (rc == NGX_AGAIN) ? cmcf->throttle_ms : 200);
 }
 
 /*
@@ -4165,12 +4495,12 @@ static ngx_int_t
 ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
     ngx_http_cache_purge_main_conf_t *cmcf)
 {
-    ngx_http_cache_purge_build_t      *b = &ngx_cache_purge_build;
     ngx_http_cache_purge_reconcile_t  *rc = &ngx_cache_purge_reconcile;
     ngx_http_cache_purge_index_sh_t   *sh;
-    ngx_uint_t                         state, level, generation, entries;
     ngx_array_t                       *handoff;
-    ngx_int_t                          r;
+    ngx_pool_t                        *pool;
+    ngx_uint_t                         state;
+    static ngx_msec_t                  reclaimed;
 
     if (cmcf->index_shpool == NULL || ngx_exiting) {
         return NGX_OK;
@@ -4183,17 +4513,53 @@ ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
         return NGX_OK;
     }
 
-    state      = sh->state;
-    generation = sh->generation;
+    state = sh->state;
 
     switch (state) {
 
     case NGX_CACHE_PURGE_INDEX_PENDING:
-        sh->state = NGX_CACHE_PURGE_INDEX_BUILDING;
+
+        if (ngx_http_cache_purge_build_init(cycle, cmcf) != NGX_OK) {
+            sh->state     = NGX_CACHE_PURGE_INDEX_FAILED;
+            sh->failed_at = ngx_current_msec;
+            ngx_log_error(NGX_LOG_CRIT, cycle->log, 0,
+                          "ngx_cache_purge: could not plan the key index "
+                          "build (cache_purge_index zone too small); "
+                          "retried every cache_purge_index_reconcile");
+        }
+
         ngx_http_cache_purge_index_unlock(cmcf);
         return NGX_AGAIN;
 
+    case NGX_CACHE_PURGE_INDEX_BUILDING:
+
+        /* the workers walk; worker 0 hands out units of those that died */
+        if (ngx_current_msec - reclaimed >= 1000) {
+            reclaimed = ngx_current_msec;
+            ngx_http_cache_purge_build_reclaim(sh, cycle->log);
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_OK;
+
     case NGX_CACHE_PURGE_INDEX_FAILED:
+
+        /* purges a failed build had taken on still have to be carried out */
+        if (sh->nbuild > 0) {
+            pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, cycle->log);
+            handoff = (pool != NULL)
+                      ? ngx_http_cache_purge_build_handoff(cmcf, pool) : NULL;
+            ngx_http_cache_purge_index_build_clear(cmcf);
+            ngx_http_cache_purge_index_unlock(cmcf);
+
+            if (handoff != NULL) {
+                ngx_http_cache_purge_build_requeue(cmcf, cycle->log, handoff);
+            }
+            if (pool != NULL) {
+                ngx_destroy_pool(pool);
+            }
+            return NGX_AGAIN;
+        }
 
         /* self-heal: after a while reconcile (frees room) and build again */
         if (ngx_current_msec - sh->failed_at >= cmcf->index_reconcile) {
@@ -4214,66 +4580,6 @@ ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
 
     switch (state) {
 
-    case NGX_CACHE_PURGE_INDEX_BUILDING:
-
-        /* a build of an index that was reset since is useless */
-        if (b->pool != NULL && b->generation != generation) {
-            ngx_http_cache_purge_build_end(b);
-        }
-
-        /* also after a reload or a reset: worker 0 starts the walk over */
-        if (b->pool == NULL
-            && ngx_http_cache_purge_build_start(cycle, b, generation)
-               != NGX_OK)
-        {
-            return NGX_AGAIN;
-        }
-
-        r = ngx_http_cache_purge_build_step(cmcf, b, cmcf->walk_budget);
-
-        if (r == NGX_AGAIN) {
-            return NGX_AGAIN;
-        }
-
-        sh = ngx_http_cache_purge_index_lock(cmcf);
-        entries = 0;
-        handoff = NULL;
-
-        if (sh != NULL && sh->generation == b->generation) {
-
-            if (r == NGX_OK && sh->state == NGX_CACHE_PURGE_INDEX_BUILDING) {
-                sh->state = NGX_CACHE_PURGE_INDEX_READY;
-
-            } else if (sh->nbuild > 0) {
-                /* abandoned: its purges have not reached every file */
-                handoff = ngx_http_cache_purge_build_handoff(cmcf, b->pool);
-            }
-
-            ngx_http_cache_purge_index_build_clear(cmcf);
-            entries = sh->entries;
-        }
-
-        ngx_http_cache_purge_index_unlock(cmcf);
-
-        if (handoff != NULL) {
-            ngx_http_cache_purge_build_requeue(cmcf, cycle->log, handoff);
-        }
-
-        ngx_time_update();
-
-        level = (r == NGX_OK) ? NGX_LOG_NOTICE : NGX_LOG_ERR;
-
-        ngx_log_error(level, cycle->log, 0,
-                      "ngx_cache_purge: key index build %s: %ui file(s) "
-                      "read, %ui purged, %ui entries, in %Mms",
-                      r == NGX_OK ? "complete" : "abandoned", b->files,
-                      b->deleted, entries, ngx_current_msec - b->started);
-
-        ngx_http_cache_purge_build_end(b);
-        rc->last = ngx_current_msec;
-
-        return NGX_AGAIN;
-
     case NGX_CACHE_PURGE_INDEX_REBUILD:
 
         /* make room by dropping stale entries, then walk again */
@@ -4285,8 +4591,11 @@ ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
         }
 
         sh = ngx_http_cache_purge_index_lock(cmcf);
-        if (sh != NULL && sh->state == NGX_CACHE_PURGE_INDEX_REBUILD) {
-            sh->state = NGX_CACHE_PURGE_INDEX_BUILDING;
+        if (sh != NULL && sh->state == NGX_CACHE_PURGE_INDEX_REBUILD
+            && ngx_http_cache_purge_build_init(cycle, cmcf) != NGX_OK)
+        {
+            sh->state     = NGX_CACHE_PURGE_INDEX_FAILED;
+            sh->failed_at = ngx_current_msec;
         }
         ngx_http_cache_purge_index_unlock(cmcf);
 
