@@ -203,8 +203,10 @@ Context: http
 
 Maximum number of entries the background queue can hold. Each slot occupies
 roughly 1–2 KB of shared memory (2048 slots ≈ 3 MB). When the queue is full,
-new wildcard / `purge_all` purge requests fall back to synchronous processing.
-Only meaningful when `cache_purge_background_queue on`.
+new wildcard / `purge_all` purge requests are answered `429 Too Many
+Requests` -- never walked synchronously in the request worker. Duplicates of a
+queued purge are recognised by hash and not queued twice. Only meaningful when
+`cache_purge_background_queue on`.
 
 
 ### `cache_purge_batch_size`
@@ -212,14 +214,115 @@ Only meaningful when `cache_purge_background_queue on`.
 ```
 Syntax:  cache_purge_batch_size <number>
 Default: 10
-Max:     64
 Context: http
 ```
 
-Number of queue entries processed per background timer tick. Values above 64
-are clamped to 64 at startup (a warning is logged). Reduce this value if purge
-operations cause iowait spikes; increase it for faster queue drain on fast
-storage. Only meaningful when `cache_purge_background_queue on`.
+How many queued purges of one cache are carried out together, by a single
+walk of its directory (or, with `cache_purge_index`, a single pass over the
+index). All patterns are matched at once -- one binary search per file over
+the sorted, prefix-free set -- so a pass costs about the same for one purge as
+for thousands; set it as high as `cache_purge_queue_size`. Only meaningful
+when `cache_purge_background_queue on`.
+
+
+### `cache_purge_walk_budget`
+
+```
+Syntax:  cache_purge_walk_budget <time>
+Default: 20ms
+Context: http
+```
+
+How long a background walk (and a key index build) runs before it yields to
+the event loop; it resumes on the next tick, `cache_purge_throttle_ms` later.
+`0` walks a whole directory in one tick.
+
+
+### `cache_purge_queue_timeout`
+
+```
+Syntax:  cache_purge_queue_timeout <time>
+Default: 0
+Context: http
+```
+
+Queued purges older than this are dropped (and logged). `0`: never -- a
+dropped purge leaves stale content.
+
+
+### `cache_purge_index`
+
+```
+Syntax:  cache_purge_index <size>
+Default: 0 (off)
+Context: http
+Requires: cache_purge_background_queue on
+```
+
+Keeps every key stored in any cache in a shared-memory index of this size, so
+that a wildcard or `purge_all` purge is a range lookup plus exact deletes
+instead of a directory walk: its cost follows the files it matches, not the
+size of the cache.
+
+* Entries are recorded when an upstream response is about to be stored,
+  subrequests (slices, background updates) and both Vary file names
+  included, and checked again when the request ends: an entry without a file
+  is dropped, a stored file without an entry gets one.
+* After a (re)start the index is built from the files on disk, in parallel
+  by all workers (a reload keeps it). Wildcards during the build are applied
+  to what is indexed and to the rest as the walk reaches it, and answered
+  `202`.
+* Size it at ~170-260 bytes per cached file (the key length decides). If it
+  runs full, a `crit` line is logged and wildcards fall back to the queued
+  walks until the index has been reconciled and rebuilt.
+* The queue and the index are locked with their slab pool's mutex, which the
+  master releases when a worker dies; a worker that dies in the middle of a
+  change resets the zone (the index is rebuilt from disk) rather than leave
+  it inconsistent.
+
+Answers: `200` purged (up to `cache_purge_index_sync_limit` files, deleted
+before the answer), `202` more than that (the rest in the background) or
+during a build, `404`/`412` nothing matched, `429` could not be queued, `400`
+a wildcard key too long (512 bytes) to match.
+
+
+### `cache_purge_index_sync_limit`
+
+```
+Syntax:  cache_purge_index_sync_limit <number>
+Default: 1024
+Context: http
+```
+
+Matching files an indexed wildcard deletes before answering; more are deleted
+in the background and the answer is `202`.
+
+
+### `cache_purge_index_reconcile`
+
+```
+Syntax:  cache_purge_index_reconcile <time>
+Default: 10m
+Context: http
+```
+
+How often entries of files the cache manager expired or evicted are dropped
+(a walk of the index in memory, not of the disk; it waits for the cache
+loader after a start). Also how often a failed index is retried.
+
+
+### `cache_purge_index_refresh`
+
+```
+Syntax:  cache_purge_index_refresh <time>
+Default: 0 (off)
+Context: http
+```
+
+How often the cache directories are walked, gently, for files the index does
+not know -- restored or copied in from outside, or lost by a process killed
+at the wrong moment. The walk only adds entries, so it is always safe; it
+logs a `warn` with the count when it had to add any.
 
 
 ### `cache_purge_throttle_ms`
