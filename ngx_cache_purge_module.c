@@ -54,7 +54,41 @@
  */
 #define NGX_CACHE_PURGE_THROTTLE_MS_DEFAULT  10  /* milliseconds */
 #define NGX_CACHE_PURGE_KEY_MAX_LEN          512
-#define NGX_CACHE_PURGE_QUEUE_TIMEOUT        60000   /* ms */
+/*
+ * Default age after which a queued purge is dropped.  0 = never: a purge that
+ * is silently discarded leaves stale content in the cache, and with passes
+ * that coalesce many purges into one walk an item routinely waits for the
+ * pass in front of it to finish.  cache_purge_queue_timeout overrides it.
+ */
+#define NGX_CACHE_PURGE_QUEUE_TIMEOUT        0       /* ms, 0 = never */
+/*
+ * Time a background walk may run before yielding to the event loop; the walk
+ * resumes from where it stopped on the next tick.  0 = run each walk to
+ * completion in a single tick (the pre-slicing behaviour).
+ */
+#define NGX_CACHE_PURGE_WALK_BUDGET_DEFAULT  20      /* ms */
+/* Cache root plus the at most three levels= subdirectory levels */
+#define NGX_CACHE_PURGE_WALK_DEPTH           4
+/* Files visited between clock reads while a walk has a time budget */
+#define NGX_CACHE_PURGE_WALK_CLOCK_EVERY     256
+
+/* How a queued purge is carried out */
+#define NGX_CACHE_PURGE_MODE_WALK            0
+#define NGX_CACHE_PURGE_MODE_INDEX           1
+
+/* cache_purge_index */
+#define NGX_CACHE_PURGE_INDEX_PENDING        0   /* not built yet: walk */
+#define NGX_CACHE_PURGE_INDEX_BUILDING       1   /* usable; build walk runs */
+#define NGX_CACHE_PURGE_INDEX_READY          2
+#define NGX_CACHE_PURGE_INDEX_REBUILD        3   /* lost an entry: walk */
+#define NGX_CACHE_PURGE_INDEX_FAILED         4   /* zone too small: walk */
+
+#define NGX_CACHE_PURGE_INDEX_PATHS          32     /* cache zones */
+#define NGX_CACHE_PURGE_INDEX_BUILD_MAX      65536  /* purges during a build */
+#define NGX_CACHE_PURGE_INDEX_BATCH          256    /* build: files per lock */
+#define NGX_CACHE_PURGE_INDEX_SLICE          1024   /* reconcile: per lock */
+#define NGX_CACHE_PURGE_INDEX_SYNC_LIMIT     1024
+#define NGX_CACHE_PURGE_INDEX_RECONCILE      600000 /* ms */
 /*
  * Byte offset from the start of a cache file to the first character of the
  * cached key string.  The nginx cache file layout is:
@@ -139,30 +173,31 @@ struct ngx_http_cache_purge_queue_item_s {
     ngx_str_t                          key_partial;
     ngx_uint_t                         hash;
     ngx_flag_t                         purge_all;
-    ngx_uint_t                         in_progress; /* reserved for ABI stability */
+    ngx_uint_t                         mode;        /* NGX_CACHE_PURGE_MODE_* */
     ngx_msec_t                         enqueued_at;
     ngx_http_cache_purge_queue_item_t *next;
+    ngx_http_cache_purge_queue_item_t *hnext;       /* duplicate buckets */
 };
 
 struct ngx_http_cache_purge_queue_s {
     ngx_http_cache_purge_queue_item_t *head;
     ngx_http_cache_purge_queue_item_t *tail;
-    /*
-     * size is always read and written while queue->mutex is held.
-     * ngx_atomic_t was used historically but implies lock-free semantics that
-     * do not exist here.  ngx_uint_t is the correct plain unsigned type.
-     */
+    /* size is always read and written while the queue is locked */
     ngx_uint_t                         size;
-    ngx_shmtx_sh_t                     sh;
-    ngx_shmtx_t                        mutex;
     ngx_slab_pool_t                   *shpool;
+    /* items by hash, so a duplicate enqueue is found in O(1) */
+    ngx_http_cache_purge_queue_item_t **buckets;
+    ngx_uint_t                         nbuckets;    /* power of two */
+    ngx_uint_t                         busy;        /* see queue_lock */
+    ngx_uint_t                         generation;
     ngx_uint_t                         max_size;
     ngx_uint_t                         batch_size;
     ngx_msec_t                         throttle_ms;
 };
 
 struct ngx_http_cache_purge_main_conf_s {
-    ngx_http_cache_purge_queue_t      *queue;
+    ngx_slab_pool_t                   *queue_shpool;   /* data: the queue */
+    ngx_uint_t                         queue_buckets;
     ngx_shm_zone_t                    *shm_zone;
     ngx_uint_t                         queue_size;
     ngx_uint_t                         batch_size;
@@ -176,6 +211,13 @@ struct ngx_http_cache_purge_main_conf_s {
      * Disabled by default because it adds a full cache walk per purge request.
      */
     ngx_flag_t                         vary_aware;
+    ngx_msec_t                         walk_budget;
+    ngx_msec_t                         queue_timeout;
+    size_t                             index_size;
+    ngx_uint_t                         index_sync_limit;
+    ngx_msec_t                         index_reconcile;
+    ngx_shm_zone_t                    *index_zone;
+    ngx_slab_pool_t                   *index_shpool;   /* data: index */
 };
 
 typedef struct {
@@ -233,6 +275,134 @@ typedef struct {
     ngx_http_file_cache_t  *cache;
 } ngx_http_cache_purge_walk_ctx_t;
 
+/*
+ * Cache directory scanner used by wildcard and purge_all purges.
+ *
+ * Compared with ngx_walk_tree() + a file handler it
+ *   - trusts readdir()'s d_type instead of stat()ing every entry,
+ *   - opens, reads and unlinks relative to the directory fd (openat /
+ *     unlinkat), so the kernel resolves one path component per call
+ *     instead of the full cache path,
+ *   - only considers 32-character names, so the in-flight temp files that
+ *     use_temp_path=off leaves next to the cache files ("<md5>.<n>") are
+ *     never read or deleted mid-write,
+ *   - matches any number of key prefixes at once: patterns are lowercased,
+ *     sorted and made prefix-free, so the one candidate that can be a prefix
+ *     of a key is the greatest pattern <= key (binary search),
+ *   - keeps its position in the tree between calls, so a background walk can
+ *     yield to the event loop and resume.
+ */
+typedef struct {
+    ngx_str_t              *elts;
+    ngx_uint_t              nelts;
+    size_t                  read_len;       /* longest pattern */
+    ngx_flag_t              match_all;      /* purge_all or a bare "*" */
+} ngx_http_cache_purge_patterns_t;
+
+typedef struct {
+    ngx_http_cache_purge_patterns_t  pats;
+    ngx_http_file_cache_t  *cache;          /* NULL: no shm accounting */
+    ngx_log_t              *log;
+    DIR                    *dirs[NGX_CACHE_PURGE_WALK_DEPTH];
+    ngx_uint_t              depth;
+    ngx_uint_t              files_checked;
+    ngx_uint_t              files_deleted;
+    ngx_uint_t              errors;         /* subdirectories not read */
+    u_char                  buf[NGX_CACHE_PURGE_KEY_MAX_LEN];
+} ngx_http_cache_purge_scan_t;
+
+/* An index entry: one cache file.  Ordered by (cache id, key, md5). */
+typedef struct {
+    ngx_rbtree_node_t       node;           /* node.key: cache id */
+    u_char                  md5[NGX_HTTP_CACHE_KEY_LEN];
+    u_short                 len;
+    u_char                  key[1];         /* lowercased, no NUL */
+} ngx_http_cache_purge_index_node_t;
+
+/* A purge received while the build walk runs, for the files it has not
+ * reached yet */
+typedef struct {
+    ngx_str_t               prefix;
+    ngx_rbtree_key_t        id;             /* cache */
+} ngx_http_cache_purge_build_pattern_t;
+
+typedef struct ngx_http_cache_purge_index_sh_s {
+    ngx_rbtree_t            rbtree;
+    ngx_rbtree_node_t       sentinel;
+    ngx_uint_t              state;          /* NGX_CACHE_PURGE_INDEX_* */
+    ngx_uint_t              entries;
+    ngx_uint_t              npaths;
+    ngx_str_t               paths[NGX_CACHE_PURGE_INDEX_PATHS];  /* ids */
+    ngx_http_cache_purge_build_pattern_t  *build;  /* purges during build */
+    ngx_uint_t              nbuild;
+    ngx_uint_t              build_version;
+    ngx_uint_t              busy;           /* see queue_lock */
+    ngx_uint_t              generation;     /* bumped by every reset */
+    ngx_msec_t              failed_at;
+} ngx_http_cache_purge_index_sh_t;
+
+/* An entry taken out of the index for deletion */
+typedef struct {
+    u_char                  md5[NGX_HTTP_CACHE_KEY_LEN];
+    ngx_str_t               key;            /* to put it back if needed */
+} ngx_http_cache_purge_index_hit_t;
+
+typedef struct {
+    ngx_pool_t                       *pool;       /* NULL: not running */
+    ngx_uint_t                        generation; /* of the index */
+    ngx_array_t                       caches;     /* file cache pointers */
+    ngx_uint_t                        next_cache;
+    ngx_http_file_cache_t            *cache;      /* being walked */
+    ngx_rbtree_key_t                  id;
+    ngx_http_cache_purge_scan_t       scan;
+    ngx_pool_t                       *snap_pool;
+    ngx_http_cache_purge_patterns_t   snap;       /* purges during build */
+    ngx_uint_t                        version;
+    ngx_rbtree_key_t                  snap_id;    /* cache of the snapshot */
+    ngx_uint_t                        files;
+    ngx_uint_t                        deleted;
+    ngx_msec_t                        started;
+} ngx_http_cache_purge_build_t;
+
+typedef struct {
+    ngx_flag_t              active;
+    ngx_uint_t              generation;     /* of the index */
+    ngx_flag_t              has_cursor;
+    ngx_rbtree_key_t        id;
+    size_t                  len;
+    u_char                  key[NGX_CACHE_PURGE_KEY_MAX_LEN];
+    u_char                  md5[NGX_HTTP_CACHE_KEY_LEN];
+    ngx_http_file_cache_t  *caches[NGX_CACHE_PURGE_INDEX_PATHS];
+    ngx_uint_t              npaths;
+    ngx_uint_t              checked;
+    ngx_uint_t              dropped;
+    ngx_msec_t              started;
+    ngx_msec_t              last;           /* end of the last pass */
+} ngx_http_cache_purge_reconcile_t;
+
+typedef struct {
+    ngx_str_t     key;
+    ngx_flag_t    purge_all;
+} ngx_http_cache_purge_pass_item_t;
+
+/*
+ * One background pass: every queued purge for one cache path, merged into a
+ * single walk.  Worker-local; pool is NULL when no pass is running.
+ */
+typedef struct {
+    ngx_pool_t                   *pool;
+    ngx_str_t                     cache_path;
+    ngx_array_t                   items;    /* pass_item_t, for re-enqueue */
+    ngx_uint_t                    mode;     /* NGX_CACHE_PURGE_MODE_* */
+    ngx_uint_t                    next_pattern;          /* index mode */
+    ngx_http_cache_purge_index_hit_t  *hits;             /* index mode */
+    ngx_http_cache_purge_index_hit_t   cursor;           /* index mode */
+    u_char                        cursor_key[NGX_CACHE_PURGE_KEY_MAX_LEN];
+    ngx_flag_t                    has_cursor;
+    ngx_msec_t                    started;
+    ngx_http_cache_purge_scan_t   scan;
+} ngx_http_cache_purge_pass_t;
+
 
 /* -- function prototypes ------------------------------------------------ */
 
@@ -246,10 +416,51 @@ static void ngx_http_cache_purge_background_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_cache_purge_enqueue(ngx_http_request_t *r,
     ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all);
 static ngx_int_t ngx_http_cache_purge_process_queue(ngx_cycle_t *cycle);
+static ngx_int_t ngx_http_cache_purge_enqueue_raw(
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_log_t *log,
+    ngx_str_t *cache_path, ngx_str_t *key, ngx_flag_t purge_all,
+    ngx_uint_t mode);
+static ngx_int_t ngx_http_cache_purge_try_enqueue(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all);
+static void ngx_http_cache_purge_pass_end(ngx_http_cache_purge_pass_t *pass);
+static ngx_http_file_cache_t *ngx_http_cache_purge_find_cache(
+    ngx_cycle_t *cycle, ngx_str_t *cache_path);
+static ngx_int_t ngx_http_cache_purge_patterns_init(
+    ngx_http_cache_purge_patterns_t *p, ngx_str_t *patterns, ngx_uint_t n,
+    ngx_log_t *log);
+static ngx_int_t ngx_http_cache_purge_scan_open(
+    ngx_http_cache_purge_scan_t *s, ngx_str_t *root);
+static void ngx_http_cache_purge_scan_close(ngx_http_cache_purge_scan_t *s);
+static ngx_int_t ngx_http_cache_purge_scan(ngx_http_cache_purge_scan_t *s,
+    ngx_msec_t budget);
+static ngx_uint_t ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *pattern);
+static ngx_int_t ngx_http_cache_purge_index_purge(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all);
+static ngx_int_t ngx_http_cache_purge_index_pass(
+    ngx_http_cache_purge_pass_t *pass,
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_msec_t budget);
+static ngx_int_t ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf);
+static void ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b);
+static ngx_http_file_cache_node_t *ngx_http_cache_purge_lookup_node(
+    ngx_http_file_cache_t *cache, u_char *key16);
+static ngx_int_t ngx_http_cache_purge_filter_init(ngx_conf_t *cf);
+static void ngx_http_cache_purge_index_rbtree_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+static ngx_http_cache_purge_index_sh_t *ngx_http_cache_purge_index_peek(
+    ngx_http_cache_purge_main_conf_t *cmcf);
+static ngx_http_cache_purge_index_sh_t *ngx_http_cache_purge_index_lock(
+    ngx_http_cache_purge_main_conf_t *cmcf);
+static void ngx_http_cache_purge_index_unlock(
+    ngx_http_cache_purge_main_conf_t *cmcf);
+static ngx_int_t ngx_http_cache_purge_unhex(u_char *p, u_char *md5);
+static ngx_int_t ngx_http_cache_purge_index_init_zone(ngx_shm_zone_t *shm_zone,
+    void *data);
 static ngx_uint_t ngx_http_cache_purge_hash_key(ngx_str_t *cache_path,
     ngx_str_t *key);
 static ngx_http_cache_purge_queue_item_t *ngx_http_cache_purge_find_duplicate(
-    ngx_http_cache_purge_queue_t *queue, ngx_uint_t hash,
+    ngx_http_cache_purge_queue_t *queue, ngx_uint_t mode, ngx_uint_t hash,
     ngx_str_t *cache_path, ngx_str_t *key);
 
 # if (NGX_HTTP_FASTCGI)
@@ -286,10 +497,6 @@ char *ngx_http_cache_purge_vary_aware_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_purge_file_cache_noop(ngx_tree_ctx_t *ctx,
     ngx_str_t *path);
-static ngx_int_t ngx_http_purge_file_cache_delete_file(ngx_tree_ctx_t *ctx,
-    ngx_str_t *path);
-static ngx_int_t ngx_http_purge_file_cache_delete_partial_file(
-    ngx_tree_ctx_t *ctx, ngx_str_t *path);
 /*
  * ngx_http_purge_file_cache_delete_exact_file:
  *
@@ -404,6 +611,41 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_cache_purge_main_conf_t, throttle_ms), NULL },
 
+    /* Time a background walk runs before yielding; 0 = whole walk per tick */
+    { ngx_string("cache_purge_walk_budget"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_main_conf_t, walk_budget), NULL },
+
+    /* Drop queued purges older than this; 0 (default) = never */
+    { ngx_string("cache_purge_queue_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_main_conf_t, queue_timeout), NULL },
+
+    /* Key index for wildcard purges (shared memory size; 0 = off) */
+    { ngx_string("cache_purge_index"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_main_conf_t, index_size), NULL },
+
+    /* Matching files an indexed wildcard deletes before answering */
+    { ngx_string("cache_purge_index_sync_limit"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_main_conf_t, index_sync_limit), NULL },
+
+    /* How often expired entries are dropped from the index */
+    { ngx_string("cache_purge_index_reconcile"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_main_conf_t, index_reconcile), NULL },
+
     { ngx_string("cache_purge_legacy_status"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_purge_legacy_status_conf,
@@ -424,7 +666,7 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
 
 static ngx_http_module_t  ngx_http_cache_purge_module_ctx = {
     NULL,                                   /* preconfiguration  */
-    NULL,                                   /* postconfiguration */
+    ngx_http_cache_purge_filter_init,       /* postconfiguration */
     ngx_http_cache_purge_create_main_conf,  /* create main conf  */
     ngx_http_cache_purge_init_main_conf,    /* init main conf    */
     NULL,                                   /* create srv conf   */
@@ -451,6 +693,9 @@ ngx_module_t  ngx_http_cache_purge_module = {
 /* Per-worker globals -- safe because nginx forks one process per worker */
 static ngx_event_t                        ngx_cache_purge_event;
 static ngx_http_cache_purge_main_conf_t  *ngx_cache_purge_main_conf;
+static ngx_http_cache_purge_pass_t        ngx_cache_purge_pass;
+static ngx_http_cache_purge_build_t       ngx_cache_purge_build;
+static ngx_http_cache_purge_reconcile_t   ngx_cache_purge_reconcile;
 
 
 /* -- main configuration ------------------------------------------------- */
@@ -471,6 +716,11 @@ ngx_http_cache_purge_create_main_conf(ngx_conf_t *cf)
     cmcf->throttle_ms         = NGX_CONF_UNSET_MSEC;
     cmcf->legacy_status_codes = NGX_CONF_UNSET;
     cmcf->vary_aware          = NGX_CONF_UNSET;
+    cmcf->walk_budget         = NGX_CONF_UNSET_MSEC;
+    cmcf->queue_timeout       = NGX_CONF_UNSET_MSEC;
+    cmcf->index_size          = NGX_CONF_UNSET_SIZE;
+    cmcf->index_sync_limit    = NGX_CONF_UNSET_UINT;
+    cmcf->index_reconcile     = NGX_CONF_UNSET_MSEC;
 
     return cmcf;
 }
@@ -480,6 +730,7 @@ ngx_http_cache_purge_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_cache_purge_main_conf_t *cmcf = conf;
     ngx_str_t                         name = ngx_string("cache_purge_queue");
+    ngx_str_t                         iname = ngx_string("cache_purge_index");
     size_t                            shm_size;
     size_t                            stride;   /* bytes per queue slot (item + 2 keys) */
 
@@ -491,6 +742,30 @@ ngx_http_cache_purge_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_conf_init_value(cmcf->legacy_status_codes, 1);
     /* Default off: vary-aware walk adds cost; opt in explicitly */
     ngx_conf_init_value(cmcf->vary_aware,          0);
+    ngx_conf_init_msec_value(cmcf->walk_budget,
+                             NGX_CACHE_PURGE_WALK_BUDGET_DEFAULT);
+    ngx_conf_init_msec_value(cmcf->queue_timeout,
+                             NGX_CACHE_PURGE_QUEUE_TIMEOUT);
+    ngx_conf_init_size_value(cmcf->index_size, 0);
+    ngx_conf_init_uint_value(cmcf->index_sync_limit,
+                             NGX_CACHE_PURGE_INDEX_SYNC_LIMIT);
+    ngx_conf_init_msec_value(cmcf->index_reconcile,
+                             NGX_CACHE_PURGE_INDEX_RECONCILE);
+
+    if (cmcf->index_size != 0 && !cmcf->background_purge) {
+        /* the build walk and reconcile run on the background drainer */
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_purge_index requires "
+                           "cache_purge_background_queue on");
+        return NGX_CONF_ERROR;
+    }
+
+    if (cmcf->index_sync_limit == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_purge_index_sync_limit must be greater "
+                           "than 0");
+        return NGX_CONF_ERROR;
+    }
 
     /*
      * Reject zero values: queue_size=0 makes the queue permanently "full"
@@ -538,7 +813,14 @@ ngx_http_cache_purge_init_main_conf(ngx_conf_t *cf, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    for (cmcf->queue_buckets = 1;
+         cmcf->queue_buckets < cmcf->queue_size;
+         cmcf->queue_buckets <<= 1)
+    { /* void */ }
+
     shm_size = sizeof(ngx_http_cache_purge_queue_t)
+             + cmcf->queue_buckets
+               * sizeof(ngx_http_cache_purge_queue_item_t *)
              + cmcf->queue_size * sizeof(ngx_http_cache_purge_queue_item_t)
              + cmcf->queue_size * 2 * NGX_CACHE_PURGE_KEY_MAX_LEN;
 
@@ -583,26 +865,135 @@ ngx_http_cache_purge_init_main_conf(ngx_conf_t *cf, void *conf)
     cmcf->shm_zone->init = ngx_http_cache_purge_init_shm_zone;
     cmcf->shm_zone->data = cmcf;
 
+    if (cmcf->index_size != 0) {
+
+        if (cmcf->index_size < NGX_CACHE_PURGE_SHM_MIN_PAGES * ngx_pagesize) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_purge_index %uz is too small",
+                               cmcf->index_size);
+            return NGX_CONF_ERROR;
+        }
+
+        cmcf->index_zone = ngx_shared_memory_add(cf, &iname,
+                                                 cmcf->index_size,
+                                                 &ngx_http_cache_purge_module);
+        if (cmcf->index_zone == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        cmcf->index_zone->init = ngx_http_cache_purge_index_init_zone;
+        cmcf->index_zone->data = cmcf;
+    }
+
     return NGX_CONF_OK;
 }
 
 /*
+ * Crash safety of the shared zones (queue and key index).
+ *
+ * Both are locked with their slab pool's mutex -- the one lock nginx's master
+ * force-unlocks (ngx_unlock_mutexes) when a worker dies holding it -- so a
+ * killed or crashed worker can never leave every other process spinning on a
+ * lock.  The holder also raises a busy flag while it has the lock; finding
+ * the flag already up on locking means the previous holder died in the middle
+ * of an update, and whatever it was changing may be half done.  The zone is
+ * then wiped and started over (ngx_slab_init) rather than trusted: for the
+ * index that means a rebuild from the cache directory, for the queue losing
+ * what was queued (logged).
+ *
+ * Because a reset re-creates the zone's root struct, processes never keep a
+ * pointer to it: they fetch it from shpool->data under the lock, and compare
+ * a generation number before acting on anything they took out of the zone
+ * earlier.
+ */
+
+static ngx_http_cache_purge_queue_t *
+ngx_http_cache_purge_queue_create(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_slab_pool_t *shpool, ngx_uint_t generation)
+{
+    ngx_http_cache_purge_queue_t  *queue;
+
+    /* a fresh pool sized for these two cannot fail them */
+    queue = ngx_slab_calloc_locked(shpool,
+                                   sizeof(ngx_http_cache_purge_queue_t));
+    if (queue == NULL) {
+        return NULL;
+    }
+
+    queue->buckets = ngx_slab_calloc_locked(shpool, cmcf->queue_buckets
+                         * sizeof(ngx_http_cache_purge_queue_item_t *));
+    if (queue->buckets == NULL) {
+        return NULL;
+    }
+
+    queue->nbuckets    = cmcf->queue_buckets;
+    queue->shpool      = shpool;
+    queue->generation  = generation;
+    queue->max_size    = cmcf->queue_size;
+    queue->batch_size  = cmcf->batch_size;
+    queue->throttle_ms = cmcf->throttle_ms;
+
+    shpool->data = queue;
+
+    return queue;
+}
+
+/* Lock the queue zone; returns the queue (NULL only if it cannot exist) */
+static ngx_http_cache_purge_queue_t *
+ngx_http_cache_purge_queue_lock(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_slab_pool_t               *shpool = cmcf->queue_shpool;
+    ngx_http_cache_purge_queue_t  *queue;
+    ngx_uint_t                     generation;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    queue = shpool->data;
+
+    if (queue != NULL && queue->busy) {
+        generation = queue->generation + 1;
+
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "ngx_cache_purge: a process died while updating the "
+                      "purge queue; resetting it, %ui queued purge(s) lost",
+                      queue->size);
+
+        ngx_slab_init(shpool);
+        shpool->data = NULL;
+        queue = ngx_http_cache_purge_queue_create(cmcf, shpool, generation);
+    }
+
+    if (queue != NULL) {
+        queue->busy = 1;
+    }
+
+    return queue;
+}
+
+static void
+ngx_http_cache_purge_queue_unlock(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_http_cache_purge_queue_t  *queue = cmcf->queue_shpool->data;
+
+    if (queue != NULL) {
+        queue->busy = 0;
+    }
+
+    ngx_shmtx_unlock(&cmcf->queue_shpool->mutex);
+}
+
+/* Unlocked peek, for hints only */
+static ngx_http_cache_purge_queue_t *
+ngx_http_cache_purge_queue_peek(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    return (cmcf->queue_shpool != NULL) ? cmcf->queue_shpool->data : NULL;
+}
+
+/*
  * Shared-memory zone initialiser -- called by the master process once per
- * nginx start or live reload.
- *
- * First boot (data == NULL):
- *   Allocate and initialise the queue struct inside the slab pool.
- *
- * Live reload (data == previous cycle's cmcf):
- *   Re-use the existing queue so that items already enqueued by the old
- *   workers are not lost.  The queue pointer is transplanted to the new
- *   cmcf so workers spawned for the new cycle find it immediately.
- *
- *   Configuration values that live inside the queue struct (batch_size,
- *   throttle_ms, max_size) are refreshed under the queue mutex so that
- *   worker timers that fire during the reload window see the new values
- *   atomically.  max_size is intentionally NOT reduced below the current
- *   queue->size to avoid making the queue appear "always full" mid-reload.
+ * nginx start or live reload.  On a reload the existing queue is kept, so
+ * purges queued before it are not lost, and its tunables are refreshed.
+ * max_size is not reduced below the current occupancy.
  */
 static ngx_int_t
 ngx_http_cache_purge_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
@@ -612,54 +1003,34 @@ ngx_http_cache_purge_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     ngx_http_cache_purge_queue_t     *queue;
     ngx_slab_pool_t                  *shpool;
 
-    if (old != NULL) {
-        /*
-         * Live reload path.  Propagate the existing queue so that items
-         * queued before the reload are not dropped.  Then refresh the
-         * tuneable fields so that changes to cache_purge_batch_size,
-         * cache_purge_throttle_ms, and cache_purge_queue_size take effect
-         * without requiring a full restart.
-         *
-         * max_size: use the larger of the new configured value and the
-         * current occupancy.  Shrinking max_size below the live queue depth
-         * would cause every subsequent enqueue to be rejected as "queue
-         * full" until the background worker drains the backlog.
-         */
-        queue = old->queue;
-        cmcf->queue = queue;
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    cmcf->queue_shpool = shpool;
 
-        ngx_shmtx_lock(&queue->mutex);
+    if (old != NULL || shm_zone->shm.exists) {
+        queue = ngx_http_cache_purge_queue_lock(cmcf);
 
-        queue->batch_size  = cmcf->batch_size;
-        queue->throttle_ms = cmcf->throttle_ms;
-        queue->max_size    = (cmcf->queue_size > queue->size)
-                             ? cmcf->queue_size : queue->size;
+        if (queue != NULL) {
+            queue->batch_size  = cmcf->batch_size;
+            queue->throttle_ms = cmcf->throttle_ms;
+            queue->max_size    = (cmcf->queue_size > queue->size)
+                                 ? cmcf->queue_size : queue->size;
+        }
 
-        ngx_shmtx_unlock(&queue->mutex);
+        ngx_http_cache_purge_queue_unlock(cmcf);
 
         return NGX_OK;
     }
 
-    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    ngx_shmtx_lock(&shpool->mutex);
+    queue = ngx_http_cache_purge_queue_create(cmcf, shpool, 1);
+    ngx_shmtx_unlock(&shpool->mutex);
 
-    queue = ngx_slab_calloc(shpool, sizeof(ngx_http_cache_purge_queue_t));
     if (queue == NULL) {
         ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
                       "ngx_cache_purge: could not allocate queue "
                       "in shared memory zone \"%V\"", &shm_zone->shm.name);
         return NGX_ERROR;
     }
-
-    queue->shpool      = shpool;
-    queue->max_size    = cmcf->queue_size;
-    queue->batch_size  = cmcf->batch_size;
-    queue->throttle_ms = cmcf->throttle_ms;
-
-    if (ngx_shmtx_create(&queue->mutex, &queue->sh, NULL) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    cmcf->queue = queue;
 
     return NGX_OK;
 }
@@ -683,7 +1054,24 @@ ngx_http_cache_purge_init_worker(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+    /*
+     * One drainer for the whole shared queue: worker 0.  Parallel walks of
+     * the same tree only contend on dentry/inode locks and multiply the sys
+     * time; one walker that coalesces every pending purge does the same work
+     * once.  The check also keeps the cache manager and cache loader out:
+     * they run init_process with ngx_worker still 0, and the loader exits
+     * once loading is done, taking any dequeued purge with it.
+     */
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
+    {
+        return NGX_OK;
+    }
+
     ngx_cache_purge_main_conf = cmcf;
+
+    /* first index reconcile one interval from now, not at every reload */
+    ngx_cache_purge_reconcile.last = ngx_current_msec;
 
     ngx_memzero(&ngx_cache_purge_event, sizeof(ngx_event_t));
     ngx_cache_purge_event.handler     = ngx_http_cache_purge_background_handler;
@@ -709,9 +1097,44 @@ ngx_http_cache_purge_init_worker(ngx_cycle_t *cycle)
 static void
 ngx_http_cache_purge_exit_worker(ngx_cycle_t *cycle)
 {
+    ngx_http_cache_purge_pass_t       *pass = &ngx_cache_purge_pass;
+    ngx_http_cache_purge_pass_item_t  *it;
+    ngx_uint_t                         i;
+
     if (ngx_cache_purge_event.timer_set) {
         ngx_del_timer(&ngx_cache_purge_event);
     }
+
+    /* an unfinished build walk is restarted by the next worker 0 */
+    ngx_http_cache_purge_build_end(&ngx_cache_purge_build);
+
+    if (pass->pool == NULL) {
+        return;
+    }
+
+    /*
+     * Exiting mid-pass (reload, graceful stop): hand the purges back to the
+     * shared queue, which survives reloads, so the next worker 0 walks them
+     * again from the start instead of silently dropping them.
+     */
+    if (ngx_cache_purge_main_conf != NULL
+        && ngx_cache_purge_main_conf->queue_shpool != NULL)
+    {
+        it = pass->items.elts;
+        for (i = 0; i < pass->items.nelts; i++) {
+            (void) ngx_http_cache_purge_enqueue_raw(
+                       ngx_cache_purge_main_conf, cycle->log,
+                       &pass->cache_path, &it[i].key, it[i].purge_all,
+                       pass->mode);
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "ngx_cache_purge: re-queued %ui purge(s) of \"%V\" "
+                      "from an unfinished walk", pass->items.nelts,
+                      &pass->cache_path);
+    }
+
+    ngx_http_cache_purge_pass_end(pass);
 }
 
 /*
@@ -744,7 +1167,7 @@ ngx_http_cache_purge_background_handler(ngx_event_t *ev)
     ngx_int_t                         rc;
     ngx_msec_t                        next_delay;
 
-    if (cmcf == NULL || cmcf->queue == NULL) {
+    if (cmcf == NULL || cmcf->queue_shpool == NULL) {
         /* cmcf not yet initialised; use the raw-ms constant directly
          * (not through ngx_parse_time, so no *1000 conversion). */
         ngx_add_timer(ev, NGX_CACHE_PURGE_THROTTLE_MS_DEFAULT);
@@ -772,76 +1195,83 @@ ngx_http_cache_purge_enqueue(ngx_http_request_t *r,
     ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all)
 {
     ngx_http_cache_purge_main_conf_t   *cmcf;
-    ngx_http_cache_purge_queue_t       *queue;
-    ngx_http_cache_purge_queue_item_t  *item;
-    ngx_uint_t                          hash;
-    u_char                             *p;
 
     cmcf = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
-    if (cmcf == NULL || cmcf->queue == NULL) {
+    if (cmcf == NULL || cmcf->queue_shpool == NULL) {
         return NGX_ERROR;
     }
 
-    queue = cmcf->queue;
-    hash  = ngx_http_cache_purge_hash_key(&cache->path->name, key);
+    return ngx_http_cache_purge_enqueue_raw(cmcf, r->connection->log,
+                                            &cache->path->name, key,
+                                            purge_all,
+                                            NGX_CACHE_PURGE_MODE_WALK);
+}
 
-    ngx_shmtx_lock(&queue->mutex);
+/*
+ * Returns NGX_OK when queued (or already queued), NGX_BUSY when the queue is
+ * full or its shared memory is exhausted, NGX_ERROR otherwise.
+ */
+static ngx_int_t
+ngx_http_cache_purge_enqueue_raw(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_log_t *log, ngx_str_t *cache_path, ngx_str_t *key,
+    ngx_flag_t purge_all, ngx_uint_t mode)
+{
+    ngx_http_cache_purge_queue_t       *queue;
+    ngx_http_cache_purge_queue_item_t  *item;
+    ngx_uint_t                          hash, size;
+    u_char                             *p;
+
+    hash = ngx_http_cache_purge_hash_key(cache_path, key);
+
+    queue = ngx_http_cache_purge_queue_lock(cmcf);
+
+    if (queue == NULL) {
+        ngx_http_cache_purge_queue_unlock(cmcf);
+        return NGX_BUSY;
+    }
 
     if (queue->size >= queue->max_size) {
-        ngx_shmtx_unlock(&queue->mutex);
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                      "ngx_cache_purge: queue full (%ui/%ui items), "
-                      "falling back to synchronous purge",
-                      queue->size, queue->max_size);
-        return NGX_ERROR;
+        size = queue->size;
+        ngx_http_cache_purge_queue_unlock(cmcf);
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "ngx_cache_purge: queue full (%ui items)", size);
+        return NGX_BUSY;
     }
 
-    if (ngx_http_cache_purge_find_duplicate(queue, hash,
-                                            &cache->path->name, key) != NULL)
+    if (ngx_http_cache_purge_find_duplicate(queue, mode, hash, cache_path,
+                                            key)
+        != NULL)
     {
-        ngx_shmtx_unlock(&queue->mutex);
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        ngx_http_cache_purge_queue_unlock(cmcf);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
                        "ngx_cache_purge: duplicate enqueue for \"%V\" "
-                       "key \"%V\", skipping", &cache->path->name, key);
+                       "key \"%V\", skipping", cache_path, key);
         return NGX_OK;
     }
 
-    item = ngx_slab_calloc(queue->shpool,
-                           sizeof(ngx_http_cache_purge_queue_item_t));
+    item = ngx_slab_calloc_locked(queue->shpool,
+                                  sizeof(ngx_http_cache_purge_queue_item_t));
     if (item == NULL) {
-        ngx_shmtx_unlock(&queue->mutex);
-        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                      "ngx_cache_purge: shared memory exhausted, "
-                      "could not allocate queue item");
-        return NGX_ERROR;
+        goto nomem;
     }
 
-    /* +1: NUL terminator required by opendir / ngx_walk_tree */
-    p = ngx_slab_alloc(queue->shpool, cache->path->name.len + 1);
+    /* +1: NUL terminator required by opendir() */
+    p = ngx_slab_alloc_locked(queue->shpool, cache_path->len + 1);
     if (p == NULL) {
-        ngx_slab_free(queue->shpool, item);
-        ngx_shmtx_unlock(&queue->mutex);
-        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                      "ngx_cache_purge: shared memory exhausted, "
-                      "could not allocate cache path buffer");
-        return NGX_ERROR;
+        ngx_slab_free_locked(queue->shpool, item);
+        goto nomem;
     }
-    ngx_memcpy(p, cache->path->name.data, cache->path->name.len);
-    p[cache->path->name.len] = '\0';
+    ngx_memcpy(p, cache_path->data, cache_path->len);
+    p[cache_path->len] = '\0';
     item->cache_path.data = p;
-    item->cache_path.len  = cache->path->name.len;
+    item->cache_path.len  = cache_path->len;
 
     if (key->len > 0) {
-        /* +1: NUL terminator for string comparisons */
-        p = ngx_slab_alloc(queue->shpool, key->len + 1);
+        p = ngx_slab_alloc_locked(queue->shpool, key->len + 1);
         if (p == NULL) {
-            ngx_slab_free(queue->shpool, item->cache_path.data);
-            ngx_slab_free(queue->shpool, item);
-            ngx_shmtx_unlock(&queue->mutex);
-            ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                          "ngx_cache_purge: shared memory exhausted, "
-                          "could not allocate key buffer");
-            return NGX_ERROR;
+            ngx_slab_free_locked(queue->shpool, item->cache_path.data);
+            ngx_slab_free_locked(queue->shpool, item);
+            goto nomem;
         }
         ngx_memcpy(p, key->data, key->len);
         p[key->len] = '\0';
@@ -851,7 +1281,7 @@ ngx_http_cache_purge_enqueue(ngx_http_request_t *r,
 
     item->hash        = hash;
     item->purge_all   = purge_all;
-    item->in_progress = 0;
+    item->mode        = mode;
     item->enqueued_at = ngx_current_msec;
 
     if (queue->tail != NULL) {
@@ -862,139 +1292,440 @@ ngx_http_cache_purge_enqueue(ngx_http_request_t *r,
     queue->tail = item;
     queue->size++;
 
-    /*
-     * Capture size while the mutex is still held.  Reading queue->size
-     * after ngx_shmtx_unlock() would be a data race on a non-atomic
-     * variable: another worker could modify it between the unlock and the
-     * log call.  The captured value is only used for a debug log, so a
-     * value that is one behind by the time the message is written is
-     * acceptable -- correctness is not affected.
-     */
-    hash = queue->size;   /* reuse 'hash' (ngx_uint_t) as a size snapshot */
+    item->hnext = queue->buckets[hash & (queue->nbuckets - 1)];
+    queue->buckets[hash & (queue->nbuckets - 1)] = item;
 
-    ngx_shmtx_unlock(&queue->mutex);
+    ngx_http_cache_purge_queue_unlock(cmcf);
 
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "ngx_cache_purge: enqueued purge of \"%V\" key \"%V\" "
-                   "(%ui item(s) in queue)",
-                   &cache->path->name, key, hash);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                   "ngx_cache_purge: enqueued purge of \"%V\" key \"%V\"",
+                   cache_path, key);
 
     return NGX_OK;
+
+nomem:
+
+    ngx_http_cache_purge_queue_unlock(cmcf);
+    ngx_log_error(NGX_LOG_CRIT, log, 0,
+                  "ngx_cache_purge: shared memory exhausted, "
+                  "could not queue a purge");
+    return NGX_BUSY;
+}
+
+/* Drop an item from its duplicate bucket.  Locked. */
+static void
+ngx_http_cache_purge_queue_unhash(ngx_http_cache_purge_queue_t *queue,
+    ngx_http_cache_purge_queue_item_t *item)
+{
+    ngx_http_cache_purge_queue_item_t  **pp;
+
+    for (pp = &queue->buckets[item->hash & (queue->nbuckets - 1)];
+         *pp != NULL;
+         pp = &(*pp)->hnext)
+    {
+        if (*pp == item) {
+            *pp = item->hnext;
+            return;
+        }
+    }
+}
+
+/* Free dequeued items -- unless the queue was reset since.  Locks. */
+static void
+ngx_http_cache_purge_queue_free(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_queue_item_t *item, ngx_uint_t generation)
+{
+    ngx_http_cache_purge_queue_t       *queue;
+    ngx_http_cache_purge_queue_item_t  *next;
+
+    queue = ngx_http_cache_purge_queue_lock(cmcf);
+
+    if (queue != NULL && queue->generation == generation) {
+        for ( /* void */ ; item != NULL; item = next) {
+            next = item->next;
+            ngx_slab_free_locked(queue->shpool, item->cache_path.data);
+            if (item->key_partial.data) {
+                ngx_slab_free_locked(queue->shpool, item->key_partial.data);
+            }
+            ngx_slab_free_locked(queue->shpool, item);
+        }
+    }
+
+    ngx_http_cache_purge_queue_unlock(cmcf);
+}
+/*
+ * Request-side wrapper around the queue.  NGX_DONE: the request has been
+ * answered (202 queued, or 429 when the queue is full).  NGX_DECLINED: not
+ * queued, the caller falls back to a synchronous walk.
+ *
+ * A full queue answers 429 rather than walking synchronously: a synchronous
+ * wildcard walk is exactly what pins request workers, and doing it under
+ * overload turns a backlog into an outage.
+ */
+static ngx_int_t
+ngx_http_cache_purge_try_enqueue(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all)
+{
+    ngx_str_t  status;
+    ngx_int_t  rc;
+
+    /* neither the index nor a walk can match a longer prefix: say so */
+    if (!purge_all && key->len > NGX_CACHE_PURGE_KEY_MAX_LEN) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "ngx_cache_purge: wildcard key too long (%uz bytes)",
+                      key->len);
+        r->main->count++;
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+        return NGX_DONE;
+    }
+
+    /* the key index answers without a walk whenever it can */
+    if (ngx_http_cache_purge_index_purge(r, cache, key, purge_all) == NGX_DONE)
+    {
+        return NGX_DONE;
+    }
+
+    rc = ngx_http_cache_purge_enqueue(r, cache, key, purge_all);
+
+    if (rc == NGX_OK) {
+        r->headers_out.status = NGX_HTTP_ACCEPTED;
+        ngx_str_set(&status, "queued");
+        r->main->count++;
+        ngx_http_finalize_request(r,
+            ngx_http_cache_purge_send_response(r, &status));
+        return NGX_DONE;
+    }
+
+    if (rc == NGX_BUSY) {
+        r->main->count++;
+        ngx_http_finalize_request(r, NGX_HTTP_TOO_MANY_REQUESTS);
+        return NGX_DONE;
+    }
+
+    return NGX_DECLINED;
 }
 
 /*
- * process_queue -- dequeue and walk exactly one item per invocation.
+ * pass_start -- dequeue the next batch and open a walk for it.
  *
- * Design: one item per timer tick.  The caller (background_handler) re-arms
- * the timer with throttle_ms after each call, giving the nginx event loop a
- * chance to handle connections between every directory walk.  This keeps
- * purge I/O from monopolising the worker for an unbounded duration.
+ * The batch is every queued purge for the cache path at the head of the
+ * queue, up to batch_size items; they are matched in one walk, so N pending
+ * wildcards cost one walk instead of N.  Items are copied into worker memory
+ * and freed from shared memory straight away, which keeps the queue free for
+ * new purges while the walk runs.
  *
- * Two-phase execution:
- *   Phase 1 -- dequeue under the mutex.
- *     The item is unlinked from the queue head and queue->size is decremented
- *     while the lock is held.  Items older than NGX_CACHE_PURGE_QUEUE_TIMEOUT
- *     are freed in place (slab_free is called while the lock is held for
- *     timed-out items only, because no subsequent walk is needed).
- *   Phase 2 -- walk outside the lock.
- *     ngx_walk_tree() and ngx_slab_free() run after ngx_shmtx_unlock().
- *     This keeps the critical section short and preserves the required
- *     lock ordering: queue_mutex -> shpool_mutex (slab_free acquires shpool).
+ * Returns NGX_OK (walk open), NGX_DONE (queue empty) or NGX_DECLINED (batch
+ * consumed but the walk could not start).
+ */
+static ngx_int_t
+ngx_http_cache_purge_pass_start(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_http_cache_purge_pass_t *pass)
+{
+    ngx_http_cache_purge_queue_t       *queue;
+    ngx_http_cache_purge_queue_item_t  *item, *next, *prev, *taken, *last;
+    ngx_http_cache_purge_pass_item_t   *it;
+    ngx_str_t                          *path, *pat;
+    ngx_uint_t                          n, batch;
+    ngx_msec_t                          now, timeout;
+    ngx_flag_t                          expired;
+    ngx_uint_t                          mode, generation;
+
+    mode    = 0;
+    now     = ngx_current_msec;
+    timeout = cmcf->queue_timeout;
+    taken   = NULL;
+    last    = NULL;
+    prev    = NULL;
+    path    = NULL;
+    n       = 0;
+
+    queue = ngx_http_cache_purge_queue_lock(cmcf);
+
+    if (queue == NULL) {
+        ngx_http_cache_purge_queue_unlock(cmcf);
+        return NGX_DONE;
+    }
+
+    batch      = queue->batch_size;
+    generation = queue->generation;
+
+    for (item = queue->head; item != NULL && n < batch; item = next) {
+        next    = item->next;
+        expired = (timeout != 0 && now - item->enqueued_at > timeout);
+
+        if (!expired
+            && path != NULL
+            && (item->mode != mode
+                || item->cache_path.len != path->len
+                || ngx_memcmp(item->cache_path.data, path->data, path->len)
+                   != 0))
+        {
+            prev = item;
+            continue;
+        }
+
+        /* unlink */
+        if (prev != NULL) {
+            prev->next = next;
+        } else {
+            queue->head = next;
+        }
+        if (queue->tail == item) {
+            queue->tail = prev;
+        }
+        queue->size--;
+        item->next = NULL;
+        ngx_http_cache_purge_queue_unhash(queue, item);
+
+        if (expired) {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "ngx_cache_purge: purge of \"%V\" key \"%V\" "
+                          "timed out after %Mms, discarding",
+                          &item->cache_path, &item->key_partial,
+                          now - item->enqueued_at);
+            ngx_slab_free_locked(queue->shpool, item->cache_path.data);
+            if (item->key_partial.data) {
+                ngx_slab_free_locked(queue->shpool, item->key_partial.data);
+            }
+            ngx_slab_free_locked(queue->shpool, item);
+            continue;
+        }
+
+        if (path == NULL) {
+            path = &item->cache_path;
+            mode = item->mode;
+        }
+
+        if (last != NULL) {
+            last->next = item;
+        } else {
+            taken = item;
+        }
+        last = item;
+        n++;
+    }
+
+    ngx_http_cache_purge_queue_unlock(cmcf);
+
+    if (taken == NULL) {
+        return NGX_DONE;
+    }
+
+    /* Copy the batch into worker memory, then release the shm items */
+
+    ngx_memzero(pass, sizeof(ngx_http_cache_purge_pass_t));
+
+    pass->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, cycle->log);
+
+    if (pass->pool == NULL
+        || ngx_array_init(&pass->items, pass->pool, n,
+                          sizeof(ngx_http_cache_purge_pass_item_t)) != NGX_OK)
+    {
+        goto failed;
+    }
+
+    pass->cache_path.len  = taken->cache_path.len;
+    pass->cache_path.data = ngx_pnalloc(pass->pool, taken->cache_path.len + 1);
+    if (pass->cache_path.data == NULL) {
+        goto failed;
+    }
+    ngx_memcpy(pass->cache_path.data, taken->cache_path.data,
+               taken->cache_path.len + 1);
+    path = &pass->cache_path;   /* the shm copy is freed below */
+
+    pat = ngx_palloc(pass->pool, n * sizeof(ngx_str_t));
+    if (pat == NULL) {
+        goto failed;
+    }
+
+    for (item = taken, n = 0; item != NULL; item = item->next, n++) {
+        it = ngx_array_push(&pass->items);
+        if (it == NULL) {
+            goto failed;
+        }
+
+        it->purge_all = item->purge_all;
+        it->key.len   = item->key_partial.len;
+        it->key.data  = ngx_pstrdup(pass->pool, &item->key_partial);
+        if (it->key.len > 0 && it->key.data == NULL) {
+            goto failed;
+        }
+
+        /* purge_all matches everything: an empty prefix */
+        pat[n].len  = it->purge_all ? 0 : it->key.len;
+        pat[n].data = it->key.data;
+
+        if (pat[n].len > 0 && pat[n].data[pat[n].len - 1] == '*') {
+            pat[n].len--;
+        }
+    }
+
+    ngx_http_cache_purge_queue_free(cmcf, taken, generation);
+    taken = NULL;
+
+    pass->scan.log   = cycle->log;
+    pass->scan.cache = ngx_http_cache_purge_find_cache(cycle,
+                                                       &pass->cache_path);
+    pass->started    = ngx_current_msec;
+    pass->mode       = mode;
+
+    if (ngx_http_cache_purge_patterns_init(&pass->scan.pats, pat, n,
+                                           cycle->log) != NGX_OK)
+    {
+        goto failed;
+    }
+
+    if (mode == NGX_CACHE_PURGE_MODE_INDEX) {
+        pass->hits = ngx_palloc(pass->pool, cmcf->index_sync_limit
+                                   * sizeof(ngx_http_cache_purge_index_hit_t));
+        if (pass->hits == NULL) {
+            goto failed;
+        }
+
+    } else if (ngx_http_cache_purge_scan_open(&pass->scan, &pass->cache_path)
+               != NGX_OK)
+    {
+        goto failed;
+    }
+
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, cycle->log, 0,
+                   "ngx_cache_purge: pass of \"%V\" (mode %ui) started for "
+                   "%ui purge(s), %ui distinct prefix(es)", &pass->cache_path,
+                   mode, pass->items.nelts, pass->scan.pats.nelts);
+
+    return NGX_OK;
+
+failed:
+
+    ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                  "ngx_cache_purge: could not start a walk of \"%V\", "
+                  "%ui purge(s) dropped", path, n);
+
+    ngx_http_cache_purge_queue_free(cmcf, taken, generation);
+
+    ngx_http_cache_purge_pass_end(pass);
+
+    return NGX_DECLINED;
+}
+
+static void
+ngx_http_cache_purge_pass_end(ngx_http_cache_purge_pass_t *pass)
+{
+    ngx_http_cache_purge_scan_close(&pass->scan);
+
+    if (pass->pool != NULL) {
+        ngx_destroy_pool(pass->pool);
+    }
+
+    ngx_memzero(pass, sizeof(ngx_http_cache_purge_pass_t));
+}
+
+/*
+ * process_queue -- advance the background walk by one time slice.
+ *
+ * A pass (see pass_start) is walked in slices of walk_budget; between slices
+ * the timer returns control to the event loop, so the draining worker keeps
+ * serving requests throughout a walk of any size.  Purges that arrive while
+ * a pass runs wait for the next pass.
  *
  * Return values:
- *   NGX_AGAIN  -- one item was processed; caller should re-arm promptly.
+ *   NGX_AGAIN  -- work remains (walk unfinished, or queue maybe non-empty).
  *   NGX_OK     -- queue is empty; caller should apply the backoff delay.
  *   NGX_ERROR  -- module not initialised; caller should apply backoff.
  */
 static ngx_int_t
 ngx_http_cache_purge_process_queue(ngx_cycle_t *cycle)
 {
-    ngx_http_cache_purge_main_conf_t   *cmcf;
-    ngx_http_cache_purge_queue_t       *queue;
-    ngx_http_cache_purge_queue_item_t  *item;
-    ngx_http_cache_purge_walk_ctx_t     ctx;
-    ngx_tree_ctx_t                      tree;
-    ngx_msec_t                          now;
+    ngx_http_cache_purge_main_conf_t  *cmcf;
+    ngx_http_cache_purge_pass_t       *pass;
+    ngx_int_t                          rc;
+    ngx_flag_t                         purges;
+    static ngx_uint_t                  turn;
 
     cmcf = ngx_cache_purge_main_conf;
-    if (cmcf == NULL || cmcf->queue == NULL) {
+    if (cmcf == NULL || cmcf->queue_shpool == NULL) {
         return NGX_ERROR;
     }
 
-    queue = cmcf->queue;
-    now   = ngx_current_msec;
-    item  = NULL;
+    pass = &ngx_cache_purge_pass;
 
-    /* Phase 1: dequeue one live item under the lock */
-    ngx_shmtx_lock(&queue->mutex);
+    /*
+     * Purges and index upkeep (build / rebuild / reconcile) share the
+     * drainer; when both have work they take turns, so neither starves.
+     * queue->head is read unlocked: it is only a hint here.
+     */
+    purges = (pass->pool != NULL
+              || (!ngx_exiting
+                  && ngx_http_cache_purge_queue_peek(cmcf) != NULL
+                  && ngx_http_cache_purge_queue_peek(cmcf)->head != NULL));
 
-    while (queue->head != NULL) {
-        item        = queue->head;
-        queue->head = item->next;
-        if (queue->head == NULL) {
-            queue->tail = NULL;
+    if (!purges || (ngx_http_cache_purge_index_peek(cmcf) != NULL && (turn++ & 1))) {
+        rc = ngx_http_cache_purge_index_work(cycle, cmcf);
+
+        if (rc == NGX_AGAIN || !purges) {
+            return rc;
         }
-        queue->size--;
-        item->next = NULL;
+    }
 
-        if ((now - item->enqueued_at) > NGX_CACHE_PURGE_QUEUE_TIMEOUT) {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                          "ngx_cache_purge: purge of \"%V\" key \"%V\" "
-                          "timed out after %Mms, discarding",
-                          &item->cache_path, &item->key_partial,
-                          now - item->enqueued_at);
-            ngx_slab_free(queue->shpool, item->cache_path.data);
-            if (item->key_partial.data) {
-                ngx_slab_free(queue->shpool, item->key_partial.data);
+    if (pass->pool == NULL) {
+
+        /* a worker shutting down after a reload leaves new passes to the
+         * new worker 0; an unfinished one is re-queued by exit_worker */
+        if (ngx_exiting) {
+            return NGX_OK;
+        }
+
+        rc = ngx_http_cache_purge_pass_start(cycle, cmcf, pass);
+
+        if (rc == NGX_DONE) {
+            return NGX_OK;
+        }
+
+        if (rc != NGX_OK) {
+            return NGX_AGAIN;
+        }
+    }
+
+    if (pass->mode == NGX_CACHE_PURGE_MODE_INDEX) {
+
+        rc = ngx_http_cache_purge_index_pass(pass, cmcf, cmcf->walk_budget);
+
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        if (rc == NGX_DECLINED) {
+            /* the index stopped being complete: walk for the rest */
+            pass->mode = NGX_CACHE_PURGE_MODE_WALK;
+
+            if (ngx_http_cache_purge_scan_open(&pass->scan, &pass->cache_path)
+                != NGX_OK)
+            {
+                ngx_http_cache_purge_pass_end(pass);
+                return NGX_AGAIN;
             }
-            ngx_slab_free(queue->shpool, item);
-            item = NULL;
-            continue;   /* try the next head */
+
+            return NGX_AGAIN;
         }
 
-        break;  /* got a live item */
+    } else if (ngx_http_cache_purge_scan(&pass->scan, cmcf->walk_budget)
+               == NGX_AGAIN)
+    {
+        return NGX_AGAIN;
     }
 
-    ngx_shmtx_unlock(&queue->mutex);
+    ngx_time_update();
 
-    if (item == NULL) {
-        return NGX_OK;  /* queue empty */
-    }
+    ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
+                  "ngx_cache_purge: %s of \"%V\" for %ui purge(s) checked "
+                  "%ui file(s), deleted %ui, in %Mms",
+                  pass->mode == NGX_CACHE_PURGE_MODE_INDEX
+                  ? "index purge" : "walk",
+                  &pass->cache_path, pass->items.nelts,
+                  pass->scan.files_checked, pass->scan.files_deleted,
+                  ngx_current_msec - pass->started);
 
-    /* Phase 2: walk the cache directory outside the lock */
-    ngx_memzero(&ctx,  sizeof(ngx_http_cache_purge_walk_ctx_t));
-    ngx_memzero(&tree, sizeof(ngx_tree_ctx_t));
-
-    tree.pre_tree_handler  = ngx_http_purge_file_cache_noop;
-    tree.post_tree_handler = ngx_http_purge_file_cache_noop;
-    tree.spec_handler      = ngx_http_purge_file_cache_noop;
-    tree.data              = &ctx;
-    tree.log               = cycle->log;
-
-    if (item->purge_all) {
-        tree.file_handler = ngx_http_purge_file_cache_delete_file;
-        ngx_walk_tree(&tree, &item->cache_path);
-
-    } else if (item->key_partial.len > 0) {
-        ctx.key_partial = item->key_partial.data;
-        ctx.key_len     = item->key_partial.len;
-        if (ctx.key_len > 0 && ctx.key_partial[ctx.key_len - 1] == '*') {
-            ctx.key_len--;
-        }
-        tree.file_handler = ngx_http_purge_file_cache_delete_partial_file;
-        ngx_walk_tree(&tree, &item->cache_path);
-    }
-
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, cycle->log, 0,
-                   "ngx_cache_purge: background walk of \"%V\" key \"%V\" "
-                   "deleted %ui file(s)",
-                   &item->cache_path, &item->key_partial, ctx.files_deleted);
-
-    ngx_slab_free(queue->shpool, item->cache_path.data);
-    if (item->key_partial.data) {
-        ngx_slab_free(queue->shpool, item->key_partial.data);
-    }
-    ngx_slab_free(queue->shpool, item);
+    ngx_http_cache_purge_pass_end(pass);
 
     return NGX_AGAIN;
 }
@@ -1017,18 +1748,21 @@ ngx_http_cache_purge_hash_key(ngx_str_t *cache_path, ngx_str_t *key)
 
 static ngx_http_cache_purge_queue_item_t *
 ngx_http_cache_purge_find_duplicate(ngx_http_cache_purge_queue_t *queue,
-    ngx_uint_t hash, ngx_str_t *cache_path, ngx_str_t *key)
+    ngx_uint_t mode, ngx_uint_t hash, ngx_str_t *cache_path, ngx_str_t *key)
 {
     ngx_http_cache_purge_queue_item_t *item;
 
-    for (item = queue->head; item; item = item->next) {
+    for (item = queue->buckets[hash & (queue->nbuckets - 1)];
+         item != NULL;
+         item = item->hnext)
+    {
         /*
          * Two-step check: hash first (fast), then full string comparison.
          * Comparing only the hash is insufficient because a 32-bit
          * multiplier hash will collide for distinct keys in large caches,
          * causing legitimate purge requests to be silently discarded.
          */
-        if (item->hash != hash) {
+        if (item->hash != hash || item->mode != mode) {
             continue;
         }
 
@@ -1116,200 +1850,45 @@ ngx_http_cache_purge_vary_aware_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 /* -- file-walk helpers -------------------------------------------------- */
 
 /*
- * Prefix-match walk handler.
- *
- * Uses walk_ctx->key_buffer (stack-allocated, fixed size) instead of
- * allocating from ngx_cycle pool on every file visit.  This eliminates
- * the memory leak that occurred on partial purges over large caches.
- */
-static ngx_int_t
-ngx_http_purge_file_cache_delete_partial_file(ngx_tree_ctx_t *ctx,
-    ngx_str_t *path)
-{
-    ngx_http_cache_purge_walk_ctx_t *wctx;
-    wctx = ctx->data;
-    ngx_file_t                       file;
-    ngx_flag_t                       remove_file = 0;
-    ngx_int_t                        n;
-
-    wctx->files_checked++;
-
-    if (wctx->key_len == 0) {
-        /* stripped wildcard -- match everything */
-        remove_file = 1;
-
-    } else {
-        if (wctx->key_len >= NGX_CACHE_PURGE_KEY_MAX_LEN) {
-            ngx_log_error(NGX_LOG_WARN, ctx->log, 0,
-                          "ngx_cache_purge: key too long (%uz bytes), "
-                          "skipping \"%V\"", wctx->key_len, path);
-            return NGX_OK;
-        }
-
-        ngx_memzero(&file, sizeof(ngx_file_t));
-        file.fd = ngx_open_file(path->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-        if (file.fd == NGX_INVALID_FILE) {
-            return NGX_OK;
-        }
-        file.log = ctx->log;
-
-        /*
-         * Cache file layout:
-         *   ngx_http_file_cache_header_t | "\nKEY: " | <key> | "\n"
-         * Skip the 6-byte "\nKEY: " prefix.
-         */
-        n = ngx_read_file(&file, wctx->key_buffer, wctx->key_len,
-                          sizeof(ngx_http_file_cache_header_t) + NGX_CACHE_PURGE_KEY_HDR_OFFSET);
-        ngx_close_file(file.fd);
-
-        if (n == (ngx_int_t) wctx->key_len
-            && ngx_strncasecmp(wctx->key_buffer, wctx->key_partial,
-                               wctx->key_len) == 0)
-        {
-            remove_file = 1;
-        }
-    }
-
-    if (remove_file) {
-        if (ngx_delete_file(path->data) == NGX_FILE_ERROR) {
-            ngx_log_error(NGX_LOG_CRIT, ctx->log, ngx_errno,
-                          "ngx_cache_purge: could not delete \"%V\"", path);
-        } else {
-            wctx->files_deleted++;
-        }
-    }
-
-    return NGX_OK;
-}
-
-/*
  * ngx_http_cache_purge_invalidate_node -- clear a cache node's shared-memory
- * metadata without requiring an ngx_http_cache_t context.
+ * metadata (exists, fs_size, the zone's size) for the cache file at path.
  *
- * The nginx file cache rbtree uses the FULL 16-byte MD5 key for lookup:
+ * The last 32 characters of a cache file path are the hex-encoded 16-byte
+ * cache key, which is what the zone's rbtree is keyed on (see
+ * ngx_http_cache_purge_lookup_node) -- for primary entries and Vary variants
+ * alike.
  *
- *   node->key (ngx_rbtree_key_t, 4 bytes) = first 4 bytes of key as big-endian
- *   fcn->key  (u_char[12])                = remaining 12 bytes of MD5
- *
- * The rbtree insert function (ngx_http_file_cache_rbtree_insert_value) resolves
- * collisions on the 4-byte prefix by falling back to a memcmp of the trailing
- * 12 bytes and placing the new node left or right accordingly.  This gives the
- * tree a total ordering on all 16 bytes, so a standard BST search works.
- *
- * The node's 16-byte key is encoded in the file path: nginx constructs the
- * cache file path as "<cache_root>/<levels>/<32-hex-char-key>" where the last
- * 32 characters are the hex-encoded 16-byte MD5 key.  Decoding those characters
- * gives us the exact key to search for -- correct for both primary entries and
- * Vary variant entries (which have different keys XOR'd with the secondary hash).
- *
- * Locking: shpool->mutex is held for the shortest possible window (lookup +
- * field updates only).  ngx_delete_file() is called by the caller AFTER this
- * function returns and the lock is released, preserving the module-wide lock
- * ordering: queue_mutex -> shpool_mutex.
+ * Locking: the zone's shpool->mutex is held for the lookup and the field
+ * updates only; the caller deletes the file after this returns.
  */
 static void
 ngx_http_cache_purge_invalidate_node(ngx_http_file_cache_t *cache,
     ngx_str_t *path)
 {
-    ngx_rbtree_node_t          *node;
-    ngx_rbtree_node_t          *sentinel;
-    ngx_http_file_cache_node_t *fcn;
-    ngx_rbtree_key_t            lookup4;
-    u_char                      key16[NGX_HTTP_CACHE_KEY_LEN];
-    u_char                     *p;
-    ngx_uint_t                  i;
-    u_int                       hi, lo;
-    int                         cmp;
+    ngx_http_file_cache_node_t  *fcn;
+    u_char                       key16[NGX_HTTP_CACHE_KEY_LEN];
 
-    /*
-     * C89: all variables declared above.
-     *
-     * Extract the 16-byte cache key from the last 32 characters of the file
-     * path.  The path always ends with a 32-character lowercase-hex filename.
-     */
-    if (path->len < 32) {
+    if (path->len < 2 * NGX_HTTP_CACHE_KEY_LEN
+        || ngx_http_cache_purge_unhex(path->data + path->len
+                                      - 2 * NGX_HTTP_CACHE_KEY_LEN, key16)
+           != NGX_OK)
+    {
         return;
     }
 
-    p = path->data + path->len - 32;
-
-    for (i = 0; i < NGX_HTTP_CACHE_KEY_LEN; i++) {
-        hi = (u_int) p[i * 2];
-        lo = (u_int) p[i * 2 + 1];
-
-        if      (hi >= '0' && hi <= '9') { hi -= '0'; }
-        else if (hi >= 'a' && hi <= 'f') { hi -= (u_int)('a' - 10); }
-        else if (hi >= 'A' && hi <= 'F') { hi -= (u_int)('A' - 10); }
-        else                             { return; /* not a valid hex path */ }
-
-        if      (lo >= '0' && lo <= '9') { lo -= '0'; }
-        else if (lo >= 'a' && lo <= 'f') { lo -= (u_int)('a' - 10); }
-        else if (lo >= 'A' && lo <= 'F') { lo -= (u_int)('A' - 10); }
-        else                             { return; }
-
-        key16[i] = (u_char) ((hi << 4) | lo);
-    }
-
-    /*
-     * Big-endian reconstruction of the 4-byte rbtree key from the first
-     * 4 bytes of the 16-byte MD5.  Mirrors nginx's own key construction in
-     * ngx_http_file_cache_set_header().
-     */
-    lookup4 = ((ngx_rbtree_key_t) key16[0] << 24)
-            | ((ngx_rbtree_key_t) key16[1] << 16)
-            | ((ngx_rbtree_key_t) key16[2] <<  8)
-            |  (ngx_rbtree_key_t) key16[3];
-
     ngx_shmtx_lock(&cache->shpool->mutex);
 
-    node     = cache->sh->rbtree.root;
-    sentinel = cache->sh->rbtree.sentinel;
+    fcn = ngx_http_cache_purge_lookup_node(cache, key16);
 
-    while (node != sentinel) {
-
-        if (lookup4 < node->key) {
-            node = node->left;
-            continue;
-        }
-
-        if (lookup4 > node->key) {
-            node = node->right;
-            continue;
-        }
-
-        /*
-         * 4-byte prefix matches.  Compare the remaining 12 bytes
-         * (key16[4..15] vs fcn->key[0..11]) using the same memcmp ordering
-         * that ngx_http_file_cache_rbtree_insert_value uses.
-         */
-        fcn = (ngx_http_file_cache_node_t *) node;
-        cmp = ngx_memcmp(key16 + sizeof(ngx_rbtree_key_t),
-                         fcn->key,
-                         NGX_HTTP_CACHE_KEY_LEN - sizeof(ngx_rbtree_key_t));
-
-        if (cmp < 0) {
-            node = node->left;
-            continue;
-        }
-
-        if (cmp > 0) {
-            node = node->right;
-            continue;
-        }
-
-        /* Exact 16-byte match -- clear the node's accounting fields */
-        if (fcn->exists) {
+    if (fcn != NULL && fcn->exists) {
 #if (nginx_version >= 1000001)
-            cache->sh->size -= fcn->fs_size;
-            fcn->fs_size     = 0;
+        cache->sh->size -= fcn->fs_size;
+        fcn->fs_size     = 0;
 #else
-            cache->sh->size -= (fcn->length + cache->bsize - 1) / cache->bsize;
-            fcn->length       = 0;
+        cache->sh->size -= (fcn->length + cache->bsize - 1) / cache->bsize;
+        fcn->length       = 0;
 #endif
-            fcn->exists = 0;
-        }
-
-        break;
+        fcn->exists = 0;
     }
 
     ngx_shmtx_unlock(&cache->shpool->mutex);
@@ -1456,22 +2035,2257 @@ ngx_http_purge_file_cache_noop(ngx_tree_ctx_t *ctx, ngx_str_t *path)
     return NGX_OK;
 }
 
-static ngx_int_t
-ngx_http_purge_file_cache_delete_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
-{
-    ngx_http_cache_purge_walk_ctx_t *wctx;
-    wctx = ctx->data;
+/* -- cache directory scanner -------------------------------------------- */
 
-    if (wctx != NULL) {
-        wctx->files_deleted++;
+# if (NGX_HTTP_FASTCGI)
+extern ngx_module_t  ngx_http_fastcgi_module;
+# endif
+# if (NGX_HTTP_PROXY)
+extern ngx_module_t  ngx_http_proxy_module;
+# endif
+# if (NGX_HTTP_SCGI)
+extern ngx_module_t  ngx_http_scgi_module;
+# endif
+# if (NGX_HTTP_UWSGI)
+extern ngx_module_t  ngx_http_uwsgi_module;
+# endif
+
+/* Is zone a proxy/fastcgi/scgi/uwsgi file cache?  Returns it, or NULL. */
+static ngx_http_file_cache_t *
+ngx_http_cache_purge_zone_cache(ngx_shm_zone_t *zone)
+{
+    void  *tag;
+
+    tag = zone->tag;
+
+    if (tag == NULL || zone->data == NULL) {
+        return NULL;
     }
 
-    if (ngx_delete_file(path->data) == NGX_FILE_ERROR) {
-        ngx_log_error(NGX_LOG_CRIT, ctx->log, ngx_errno,
-                      "ngx_cache_purge: could not delete \"%V\"", path);
+    if (0
+# if (NGX_HTTP_FASTCGI)
+        || tag == &ngx_http_fastcgi_module
+# endif
+# if (NGX_HTTP_PROXY)
+        || tag == &ngx_http_proxy_module
+# endif
+# if (NGX_HTTP_SCGI)
+        || tag == &ngx_http_scgi_module
+# endif
+# if (NGX_HTTP_UWSGI)
+        || tag == &ngx_http_uwsgi_module
+# endif
+       )
+    {
+        return zone->data;
+    }
+
+    return NULL;
+}
+
+/*
+ * Find the file cache that owns cache_path, so a background walk can keep the
+ * zone's shared-memory accounting right.  The queue stores only the path:
+ * it survives reloads, and a pointer into the old cycle would not.
+ */
+static ngx_http_file_cache_t *
+ngx_http_cache_purge_find_cache(ngx_cycle_t *cycle, ngx_str_t *cache_path)
+{
+    ngx_list_part_t        *part;
+    ngx_shm_zone_t         *zone;
+    ngx_http_file_cache_t  *cache;
+    ngx_uint_t              i;
+
+    part = &cycle->shared_memory.part;
+    zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            zone = part->elts;
+            i = 0;
+        }
+
+        cache = ngx_http_cache_purge_zone_cache(&zone[i]);
+
+        if (cache != NULL
+            && cache->path != NULL
+            && cache->path->name.len == cache_path->len
+            && ngx_strncmp(cache->path->name.data, cache_path->data,
+                           cache_path->len) == 0)
+        {
+            return cache;
+        }
+    }
+
+    return NULL;
+}
+
+static int ngx_libc_cdecl
+ngx_http_cache_purge_pattern_cmp(const void *one, const void *two)
+{
+    const ngx_str_t  *a = one;
+    const ngx_str_t  *b = two;
+    ngx_int_t         rc;
+
+    rc = ngx_memn2cmp(a->data, b->data, a->len, b->len);
+
+    return (rc < 0) ? -1 : (rc > 0);
+}
+
+/*
+ * Load the prefixes to match.  Lowercases in place (matching has always been
+ * case-insensitive), sorts, and drops every pattern that another pattern is a
+ * prefix of: "/cdn/a/" already covers "/cdn/a/b/".  In a prefix-free sorted
+ * set the only pattern that can be a prefix of a key is the greatest one
+ * that is <= the key, so matching is one binary search per file however many
+ * purges were coalesced.  An empty pattern (bare "*", purge_all) matches
+ * every key and makes reading the keys unnecessary.
+ */
+static ngx_int_t
+ngx_http_cache_purge_patterns_init(ngx_http_cache_purge_patterns_t *p,
+    ngx_str_t *patterns, ngx_uint_t n, ngx_log_t *log)
+{
+    ngx_uint_t  i, j;
+
+    p->match_all = 0;
+    p->read_len  = 0;
+
+    for (i = 0, j = 0; i < n; i++) {
+
+        if (patterns[i].len == 0) {
+            p->match_all = 1;
+            continue;
+        }
+
+        if (patterns[i].len >= NGX_CACHE_PURGE_KEY_MAX_LEN) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "ngx_cache_purge: key too long (%uz bytes), "
+                          "skipping \"%V\"", patterns[i].len, &patterns[i]);
+            continue;
+        }
+
+        ngx_strlow(patterns[i].data, patterns[i].data, patterns[i].len);
+        patterns[j++] = patterns[i];
+    }
+
+    n = j;
+
+    if (n > 1) {
+        ngx_qsort(patterns, n, sizeof(ngx_str_t),
+                  ngx_http_cache_purge_pattern_cmp);
+
+        /* sorted: a pattern that covers others comes right before them */
+        for (i = 1, j = 0; i < n; i++) {
+            if (patterns[i].len >= patterns[j].len
+                && ngx_memcmp(patterns[i].data, patterns[j].data,
+                              patterns[j].len) == 0)
+            {
+                continue;
+            }
+            patterns[++j] = patterns[i];
+        }
+        n = j + 1;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (patterns[i].len > p->read_len) {
+            p->read_len = patterns[i].len;
+        }
+    }
+
+    p->elts  = patterns;
+    p->nelts = n;
+
+    return (p->match_all || n > 0) ? NGX_OK : NGX_DECLINED;
+}
+
+/* Is one of the patterns a prefix of key (already lowercased)? */
+static ngx_flag_t
+ngx_http_cache_purge_patterns_match(ngx_http_cache_purge_patterns_t *p,
+    u_char *key, size_t len)
+{
+    ngx_str_t   *pat;
+    ngx_uint_t   lo, hi, mid;
+
+    if (p->match_all) {
+        return 1;
+    }
+
+    /* greatest pattern <= key */
+    lo = 0;
+    hi = p->nelts;
+
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        pat = &p->elts[mid];
+
+        if (ngx_memn2cmp(pat->data, key, pat->len, len) <= 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo == 0) {
+        return 0;
+    }
+
+    pat = &p->elts[lo - 1];
+
+    return len >= pat->len && ngx_memcmp(pat->data, key, pat->len) == 0;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_scan_open(ngx_http_cache_purge_scan_t *s,
+    ngx_str_t *root)
+{
+    DIR  *dir;
+
+    /* root->data is NUL-terminated: cache paths from the configuration and
+     * the copies made by enqueue both are */
+    dir = opendir((const char *) root->data);
+    if (dir == NULL) {
+        ngx_log_error(NGX_LOG_CRIT, s->log, ngx_errno,
+                      "ngx_cache_purge: opendir() \"%V\" failed", root);
+        return NGX_ERROR;
+    }
+
+    s->dirs[0] = dir;
+    s->depth   = 1;
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_cache_purge_scan_close(ngx_http_cache_purge_scan_t *s)
+{
+    while (s->depth > 0) {
+        (void) closedir(s->dirs[--s->depth]);
+    }
+}
+
+/*
+ * Advance to the next cache file.  NGX_OK: *dir_fd / *name name it (valid
+ * until the next call).  NGX_DONE: the tree is exhausted.
+ */
+static ngx_int_t
+ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s, int *dir_fd,
+    ngx_str_t *name)
+{
+    DIR            *dir, *sub;
+    struct dirent  *de;
+    struct stat     st;
+    unsigned char   type;
+    int             fd;
+
+    while (s->depth > 0) {
+
+        dir     = s->dirs[s->depth - 1];
+        *dir_fd = dirfd(dir);
+
+        de = readdir(dir);
+
+        if (de == NULL) {
+            (void) closedir(dir);
+            s->depth--;
+            continue;
+        }
+
+        /* ".", ".." and nothing nginx creates */
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+
+        type = de->d_type;
+
+        if (type == DT_UNKNOWN) {
+            if (fstatat(*dir_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == -1)
+            {
+                continue;
+            }
+            type = S_ISDIR(st.st_mode) ? DT_DIR
+                 : S_ISREG(st.st_mode) ? DT_REG : DT_UNKNOWN;
+        }
+
+        if (type == DT_DIR) {
+            if (s->depth == NGX_CACHE_PURGE_WALK_DEPTH) {
+                continue;
+            }
+
+            fd = openat(*dir_fd, de->d_name,
+                        O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+            if (fd == -1) {
+                if (ngx_errno != NGX_ENOENT) {
+                    s->errors++;
+                    ngx_log_error(NGX_LOG_ERR, s->log, ngx_errno,
+                                  "ngx_cache_purge: openat() \"%s\" failed",
+                                  de->d_name);
+                }
+                continue;
+            }
+
+            sub = fdopendir(fd);
+            if (sub == NULL) {
+                s->errors++;
+                (void) close(fd);
+                continue;
+            }
+
+            s->dirs[s->depth++] = sub;
+            continue;
+        }
+
+        name->data = (u_char *) de->d_name;
+        name->len  = ngx_strlen(de->d_name);
+
+        /* cache files are named by their 32 hex digit md5 key; anything
+         * else, notably "<md5>.<n>" temp files being written, is left be */
+        if (type != DT_REG || name->len != 2 * NGX_HTTP_CACHE_KEY_LEN) {
+            continue;
+        }
+
+        return NGX_OK;
+    }
+
+    return NGX_DONE;
+}
+
+/*
+ * Read up to size bytes of the KEY: line of dir_fd/name into buf.  Returns
+ * the byte count read (the key may be followed by "\n" and headers), or -1.
+ */
+static ssize_t
+ngx_http_cache_purge_read_key(int dir_fd, const char *name, u_char *buf,
+    size_t size)
+{
+    static int   open_flags = O_RDONLY|O_CLOEXEC
+#  ifdef O_NOATIME
+                              |O_NOATIME
+#  endif
+                              ;
+    ssize_t      n;
+    int          fd;
+
+    fd = openat(dir_fd, name, open_flags);
+
+#  ifdef O_NOATIME
+    /* O_NOATIME needs the file's owner; fall back once and remember */
+    if (fd == -1 && ngx_errno == NGX_EPERM && (open_flags & O_NOATIME)) {
+        open_flags &= ~O_NOATIME;
+        fd = openat(dir_fd, name, open_flags);
+    }
+#  endif
+
+    if (fd == -1) {
+        return -1;
+    }
+
+    n = pread(fd, buf, size,
+              sizeof(ngx_http_file_cache_header_t)
+              + NGX_CACHE_PURGE_KEY_HDR_OFFSET);
+    (void) close(fd);
+
+    return n;
+}
+
+/*
+ * Walk (or continue walking) the tree, deleting the files whose key matches.
+ * Returns NGX_OK when the walk is complete and NGX_AGAIN when budget (ms,
+ * 0 = none) ran out first.
+ */
+static ngx_int_t
+ngx_http_cache_purge_scan(ngx_http_cache_purge_scan_t *s, ngx_msec_t budget)
+{
+    ngx_str_t   name;
+    ngx_uint_t  visited;
+    ngx_msec_t  start;
+    ngx_flag_t  match;
+    ssize_t     n;
+    int         dir_fd;
+
+    start   = ngx_current_msec;
+    visited = 0;
+
+    while (ngx_http_cache_purge_scan_next(s, &dir_fd, &name) == NGX_OK) {
+
+        s->files_checked++;
+
+        if (s->pats.match_all) {
+            match = 1;
+
+        } else {
+            n = ngx_http_cache_purge_read_key(dir_fd, (char *) name.data,
+                                              s->buf, s->pats.read_len);
+            if (n > 0) {
+                ngx_strlow(s->buf, s->buf, (size_t) n);
+                match = ngx_http_cache_purge_patterns_match(&s->pats, s->buf,
+                                                            (size_t) n);
+            } else {
+                match = 0;
+            }
+        }
+
+        if (match) {
+
+            /* clear the shm node first: no HIT on a vanished file, and the
+             * zone's size stays right for the cache manager */
+            if (s->cache != NULL) {
+                ngx_http_cache_purge_invalidate_node(s->cache, &name);
+            }
+
+            if (unlinkat(dir_fd, (char *) name.data, 0) == -1) {
+                if (ngx_errno != NGX_ENOENT) {
+                    ngx_log_error(NGX_LOG_CRIT, s->log, ngx_errno,
+                                  "ngx_cache_purge: could not delete "
+                                  "\"%V\"", &name);
+                }
+            } else {
+                s->files_deleted++;
+            }
+        }
+
+        if (budget != 0
+            && ++visited % NGX_CACHE_PURGE_WALK_CLOCK_EVERY == 0)
+        {
+            ngx_time_update();
+
+            if (ngx_current_msec - start >= budget) {
+                return NGX_AGAIN;
+            }
+        }
     }
 
     return NGX_OK;
+}
+
+/* A whole walk, synchronously, for one wildcard (or purge_all when pattern
+ * is empty).  Returns the number of files deleted. */
+static ngx_uint_t
+ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *pattern)
+{
+    ngx_http_cache_purge_scan_t  s;
+    ngx_str_t                    pat;
+
+    ngx_memzero(&s, sizeof(ngx_http_cache_purge_scan_t));
+    s.log   = r->connection->log;
+    s.cache = cache;
+
+    /* lowercased in place by patterns_init: work on a copy of the key */
+    pat.len  = pattern->len;
+    pat.data = ngx_pnalloc(r->pool, pattern->len + 1);
+    if (pat.data == NULL) {
+        return 0;
+    }
+    ngx_memcpy(pat.data, pattern->data, pattern->len);
+
+    if (ngx_http_cache_purge_patterns_init(&s.pats, &pat, 1, s.log) != NGX_OK
+        || ngx_http_cache_purge_scan_open(&s, &cache->path->name) != NGX_OK)
+    {
+        return 0;
+    }
+
+    (void) ngx_http_cache_purge_scan(&s, 0);
+    ngx_http_cache_purge_scan_close(&s);
+
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ngx_cache_purge: walk of \"%V\" checked %ui file(s), "
+                   "deleted %ui", &cache->path->name, s.files_checked,
+                   s.files_deleted);
+
+    return s.files_deleted;
+}
+
+
+/* -- key index ------------------------------------------------------------ */
+
+/*
+ * cache_purge_index keeps every cache key in a shared-memory rbtree ordered
+ * by (cache, lowercased key, md5), so a wildcard purge is a range lookup
+ * plus exact deletes: its cost follows the files that match, not the size of
+ * the cache.
+ *
+ * Entries are recorded by a header filter when an upstream response goes to
+ * a cache (before the file is stored, so a stored file is never unindexed).
+ * With Vary the file ends up under either c->key or c->main
+ * (ngx_http_file_cache_update_variant), so both are recorded.  The filter
+ * sees subrequests too: slices and background updates.
+ *
+ * Files already on disk are added by a build walk after a (re)start.  While
+ * it runs, wildcards are applied to the entries indexed so far and kept in a
+ * list the walk checks each file against, so nothing needs a second walk.
+ * If the zone runs full the index is no longer complete: wildcards fall back
+ * to walks until a reconcile + rebuild has made it whole again.
+ *
+ * Entries outlive their files when the cache manager expires them; a
+ * periodic reconcile drops entries whose cache node is gone.
+ */
+
+static u_char  ngx_http_cache_purge_zero_md5[NGX_HTTP_CACHE_KEY_LEN];
+
+/* The index of cmcf; under the lock it is current, unlocked only a hint */
+static ngx_http_cache_purge_index_sh_t *
+ngx_http_cache_purge_index_peek(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    return (cmcf->index_shpool != NULL) ? cmcf->index_shpool->data : NULL;
+}
+
+/* Locked (fresh or reset pool) */
+static ngx_http_cache_purge_index_sh_t *
+ngx_http_cache_purge_index_create(ngx_slab_pool_t *shpool,
+    ngx_uint_t generation)
+{
+    ngx_http_cache_purge_index_sh_t  *sh;
+
+    sh = ngx_slab_calloc_locked(shpool,
+                                sizeof(ngx_http_cache_purge_index_sh_t));
+    if (sh == NULL) {
+        return NULL;
+    }
+
+    ngx_rbtree_init(&sh->rbtree, &sh->sentinel,
+                    ngx_http_cache_purge_index_rbtree_insert);
+
+    sh->state      = NGX_CACHE_PURGE_INDEX_PENDING;
+    sh->generation = generation;
+
+    shpool->data = sh;
+
+    /* running full is reported by the module, once */
+    shpool->log_nomem = 0;
+
+    return sh;
+}
+
+/*
+ * Lock the index (see queue_lock for the busy flag).  A reset leaves an
+ * empty index in PENDING: wildcards walk until the drainer has rebuilt it.
+ * Never returns NULL in practice: a wiped pool always has room for the root.
+ */
+static ngx_http_cache_purge_index_sh_t *
+ngx_http_cache_purge_index_lock(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_slab_pool_t                  *shpool = cmcf->index_shpool;
+    ngx_http_cache_purge_index_sh_t  *sh;
+    ngx_uint_t                        generation;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    sh = shpool->data;
+
+    if (sh == NULL || sh->busy) {
+        generation = (sh != NULL) ? sh->generation + 1 : 1;
+
+        if (sh != NULL) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "ngx_cache_purge: a process died while updating the "
+                          "key index; resetting it (it is rebuilt from the "
+                          "cache directories)");
+        }
+
+        ngx_slab_init(shpool);
+        shpool->data = NULL;
+        sh = ngx_http_cache_purge_index_create(shpool, generation);
+    }
+
+    if (sh != NULL) {
+        sh->busy = 1;
+    }
+
+    return sh;
+}
+
+static void
+ngx_http_cache_purge_index_unlock(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = cmcf->index_shpool->data;
+
+    if (sh != NULL) {
+        sh->busy = 0;
+    }
+
+    ngx_shmtx_unlock(&cmcf->index_shpool->mutex);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_index_cmp(ngx_rbtree_key_t id, u_char *key, size_t len,
+    u_char *md5, ngx_http_cache_purge_index_node_t *n)
+{
+    ngx_int_t  rc;
+
+    if (id != n->node.key) {
+        return (id < n->node.key) ? -1 : 1;
+    }
+
+    rc = ngx_memn2cmp(key, n->key, len, n->len);
+    if (rc != 0) {
+        return rc;
+    }
+
+    return ngx_memcmp(md5, n->md5, NGX_HTTP_CACHE_KEY_LEN);
+}
+
+static void
+ngx_http_cache_purge_index_rbtree_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_http_cache_purge_index_node_t  *n;
+    ngx_rbtree_node_t                 **p;
+
+    n = (ngx_http_cache_purge_index_node_t *) node;
+
+    for ( ;; ) {
+
+        p = (ngx_http_cache_purge_index_cmp(node->key, n->key, n->len, n->md5,
+                 (ngx_http_cache_purge_index_node_t *) temp) < 0)
+            ? &temp->left : &temp->right;
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+/* First entry >= (id, key, md5), or > it when after is set.  Locked. */
+static ngx_http_cache_purge_index_node_t *
+ngx_http_cache_purge_index_bound(ngx_http_cache_purge_index_sh_t *sh,
+    ngx_rbtree_key_t id, u_char *key, size_t len, u_char *md5,
+    ngx_flag_t after)
+{
+    ngx_rbtree_node_t  *node, *sentinel, *best;
+    ngx_int_t           rc;
+
+    node     = sh->rbtree.root;
+    sentinel = sh->rbtree.sentinel;
+    best     = NULL;
+
+    while (node != sentinel) {
+
+        rc = ngx_http_cache_purge_index_cmp(id, key, len, md5,
+                 (ngx_http_cache_purge_index_node_t *) node);
+
+        if (rc < 0 || (rc == 0 && !after)) {
+            best = node;
+            node = node->left;
+
+        } else {
+            node = node->right;
+        }
+    }
+
+    return (ngx_http_cache_purge_index_node_t *) best;
+}
+
+static ngx_flag_t
+ngx_http_cache_purge_index_in_range(ngx_http_cache_purge_index_node_t *n,
+    ngx_rbtree_key_t id, ngx_str_t *prefix)
+{
+    return n != NULL
+           && n->node.key == id
+           && n->len >= prefix->len
+           && ngx_memcmp(n->key, prefix->data, prefix->len) == 0;
+}
+
+/*
+ * The index can no longer vouch for every file (an entry could not be
+ * stored): stop using it for wildcards.  Locked.
+ */
+static void
+ngx_http_cache_purge_index_lost(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_log_t *log, const char *why)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+
+    if (sh->state == NGX_CACHE_PURGE_INDEX_READY) {
+        sh->state = NGX_CACHE_PURGE_INDEX_REBUILD;
+        ngx_log_error(NGX_LOG_CRIT, log, 0,
+                      "ngx_cache_purge: key index incomplete: %s "
+                      "(%ui entries); wildcard purges walk the cache until "
+                      "it has been reconciled and rebuilt", why,
+                      sh->entries);
+
+    } else if (sh->state == NGX_CACHE_PURGE_INDEX_BUILDING) {
+        sh->state     = NGX_CACHE_PURGE_INDEX_FAILED;
+        sh->failed_at = ngx_current_msec;
+        ngx_log_error(NGX_LOG_CRIT, log, 0,
+                      "ngx_cache_purge: key index build failed: %s "
+                      "(%ui entries); wildcard purges walk the cache, and "
+                      "the build is retried every cache_purge_index_reconcile",
+                      why, sh->entries);
+    }
+
+    /* PENDING and REBUILD walk anyway, and the coming build adds the file */
+}
+
+/* Id of a cache path in the index (created if asked).  Locked. */
+static ngx_int_t
+ngx_http_cache_purge_index_cache_id(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_str_t *path, ngx_flag_t create)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_uint_t                        i;
+    u_char                           *p;
+
+    for (i = 0; i < sh->npaths; i++) {
+        if (sh->paths[i].len == path->len
+            && ngx_memcmp(sh->paths[i].data, path->data, path->len) == 0)
+        {
+            return (ngx_int_t) i;
+        }
+    }
+
+    if (!create || sh->npaths == NGX_CACHE_PURGE_INDEX_PATHS) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_slab_alloc_locked(cmcf->index_shpool, path->len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(p, path->data, path->len);
+    sh->paths[sh->npaths].data = p;
+    sh->paths[sh->npaths].len  = path->len;
+
+    return (ngx_int_t) sh->npaths++;
+}
+
+/* NGX_OK added, NGX_DECLINED already there, NGX_ERROR no memory.  Locked. */
+static ngx_int_t
+ngx_http_cache_purge_index_insert(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_rbtree_key_t id, u_char *key, size_t len, u_char *md5)
+{
+    ngx_http_cache_purge_index_sh_t    *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_http_cache_purge_index_node_t  *n;
+
+    n = ngx_http_cache_purge_index_bound(sh, id, key, len, md5, 0);
+
+    if (n != NULL && ngx_http_cache_purge_index_cmp(id, key, len, md5, n) == 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    n = ngx_slab_alloc_locked(cmcf->index_shpool,
+                    offsetof(ngx_http_cache_purge_index_node_t, key) + len);
+    if (n == NULL) {
+        return NGX_ERROR;
+    }
+
+    n->node.key = id;
+    ngx_memcpy(n->md5, md5, NGX_HTTP_CACHE_KEY_LEN);
+    n->len = (u_short) len;
+    ngx_memcpy(n->key, key, len);
+
+    ngx_rbtree_insert(&sh->rbtree, &n->node);
+    sh->entries++;
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_cache_purge_index_remove(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_index_node_t *n)
+{
+    ngx_rbtree_delete(&ngx_http_cache_purge_index_peek(cmcf)->rbtree, &n->node);
+    ngx_slab_free_locked(cmcf->index_shpool, n);
+    ngx_http_cache_purge_index_peek(cmcf)->entries--;
+}
+
+/*
+ * An entry this request added, for pending_cleanup.  The header filter
+ * records every upstream response that may be stored -- whether it will be
+ * is only decided afterwards -- so entries of responses that were not stored
+ * are taken out again when the request ends.  Otherwise a flood of uncachable
+ * misses (errors, no_cache, random URLs) would fill the index with keys that
+ * have no file.
+ */
+typedef struct {
+    ngx_http_cache_purge_main_conf_t  *cmcf;
+    ngx_http_file_cache_t             *cache;
+    ngx_uint_t                         generation;
+    ngx_rbtree_key_t                   id;
+    ngx_uint_t                         n;           /* md5s: 1, or 2 (Vary) */
+    u_char                             created[2];  /* added by this request */
+    ngx_flag_t                         failed;      /* could not be added */
+    u_char                             md5[2][NGX_HTTP_CACHE_KEY_LEN];
+    size_t                             len;
+    u_char                             key[1];
+} ngx_http_cache_purge_index_pending_t;
+
+/*
+ * Request end, when the response is stored (or not) for sure.
+ *
+ * Entries this request added are dropped unless a file backs them or may
+ * still come: the zone's node exists, is in use or is being updated -- the
+ * test reconcile applies.  Another request storing the same key holds its
+ * node, so an entry it relies on is never dropped here.
+ *
+ * And the other way round: if the index was reset while the request ran, or
+ * its entry could not be added, a rebuild walk may already have passed the
+ * directory before the file was renamed into it.  A stored file is added
+ * again here, so it is never left unindexed.
+ */
+static void
+ngx_http_cache_purge_index_pending_cleanup(void *data)
+{
+    ngx_http_cache_purge_index_pending_t  *p = data;
+    ngx_http_cache_purge_index_sh_t       *sh;
+    ngx_http_cache_purge_index_node_t     *n;
+    ngx_http_file_cache_node_t            *fcn;
+    ngx_flag_t                             stored, backed, same;
+    ngx_int_t                              id;
+    ngx_uint_t                             i;
+
+    sh = ngx_http_cache_purge_index_lock(p->cmcf);
+
+    if (sh == NULL) {
+        ngx_http_cache_purge_index_unlock(p->cmcf);
+        return;
+    }
+
+    same = (sh->generation == p->generation);
+
+    for (i = 0; i < p->n; i++) {
+
+        if (same && !p->created[i] && !p->failed) {
+            continue;
+        }
+
+        ngx_shmtx_lock(&p->cache->shpool->mutex);
+
+        fcn    = ngx_http_cache_purge_lookup_node(p->cache, p->md5[i]);
+        stored = (fcn != NULL && fcn->exists);
+        backed = (fcn != NULL
+                  && (fcn->exists || fcn->count != 0 || fcn->updating));
+
+        ngx_shmtx_unlock(&p->cache->shpool->mutex);
+
+        if (same && p->created[i] && !backed) {
+
+            n = ngx_http_cache_purge_index_bound(sh, p->id, p->key, p->len,
+                                                 p->md5[i], 0);
+            if (n != NULL
+                && ngx_http_cache_purge_index_cmp(p->id, p->key, p->len,
+                                                  p->md5[i], n) == 0)
+            {
+                ngx_http_cache_purge_index_remove(p->cmcf, n);
+            }
+
+            continue;
+        }
+
+        if ((!same || p->failed) && stored) {
+
+            id = ngx_http_cache_purge_index_cache_id(p->cmcf,
+                                                     &p->cache->path->name, 1);
+
+            if (id == NGX_ERROR
+                || ngx_http_cache_purge_index_insert(p->cmcf,
+                                                     (ngx_rbtree_key_t) id,
+                                                     p->key, p->len,
+                                                     p->md5[i])
+                   == NGX_ERROR)
+            {
+                ngx_http_cache_purge_index_lost(p->cmcf, ngx_cycle->log,
+                    "cache_purge_index zone is full, increase "
+                    "cache_purge_index");
+            }
+        }
+    }
+
+    ngx_http_cache_purge_index_unlock(p->cmcf);
+}
+
+/* Header filter: record the key of a response that is going to a cache */
+static void
+ngx_http_cache_purge_index_record(ngx_http_request_t *r,
+    ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_http_cache_purge_index_pending_t  *p;
+    ngx_http_cache_purge_index_sh_t       *sh;
+    ngx_http_cache_t                      *c;
+    ngx_pool_cleanup_t                    *cln;
+    ngx_str_t                             *key;
+    ngx_uint_t                             i;
+    ngx_int_t                              id, rc;
+    size_t                                 len, n;
+    u_char                                 buf[NGX_CACHE_PURGE_KEY_MAX_LEN];
+
+    c   = r->cache;
+    key = c->keys.elts;
+    len = 0;
+
+    /* the KEY: line of the cache file, truncated like the index keeps it:
+     * a truncated key still matches every prefix a purge may carry */
+    for (i = 0; i < c->keys.nelts; i++) {
+        n = ngx_min(key[i].len, NGX_CACHE_PURGE_KEY_MAX_LEN - 1 - len);
+        ngx_memcpy(buf + len, key[i].data, n);
+        len += n;
+    }
+
+    ngx_strlow(buf, buf, len);
+
+    /* r->pool is the main request's pool, for subrequests too */
+    p = ngx_pcalloc(r->pool,
+                    offsetof(ngx_http_cache_purge_index_pending_t, key) + len);
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+
+    if (p == NULL || cln == NULL) {
+        return;
+    }
+
+    p->cmcf  = cmcf;
+    p->cache = c->file_cache;
+    p->len   = len;
+    ngx_memcpy(p->key, buf, len);
+
+    ngx_memcpy(p->md5[p->n++], c->key, NGX_HTTP_CACHE_KEY_LEN);
+    if (ngx_memcmp(c->key, c->main, NGX_HTTP_CACHE_KEY_LEN) != 0) {
+        ngx_memcpy(p->md5[p->n++], c->main, NGX_HTTP_CACHE_KEY_LEN);
+    }
+
+    sh = ngx_http_cache_purge_index_lock(cmcf);
+
+    if (sh != NULL) {
+        p->generation = sh->generation;
+
+        id = ngx_http_cache_purge_index_cache_id(cmcf,
+                                                 &c->file_cache->path->name, 1);
+        if (id == NGX_ERROR) {
+            p->failed = 1;
+
+        } else {
+            p->id = (ngx_rbtree_key_t) id;
+
+            for (i = 0; i < p->n; i++) {
+                rc = ngx_http_cache_purge_index_insert(cmcf, p->id, buf, len,
+                                                       p->md5[i]);
+                if (rc == NGX_OK) {
+                    p->created[i] = 1;
+
+                } else if (rc == NGX_ERROR) {
+                    p->failed = 1;
+                    break;
+                }
+            }
+        }
+
+        if (p->failed) {
+            ngx_http_cache_purge_index_lost(cmcf, r->connection->log,
+                "cache_purge_index zone is full, increase cache_purge_index");
+        }
+    }
+
+    ngx_http_cache_purge_index_unlock(cmcf);
+
+    cln->handler = ngx_http_cache_purge_index_pending_cleanup;
+    cln->data    = p;
+}
+/*
+ * Take (remove) up to max entries under prefix.  Key copies go to pool, so
+ * an entry whose file is not there yet can be put back.  Locked.
+ */
+static ngx_uint_t
+ngx_http_cache_purge_index_take(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_rbtree_key_t id, ngx_str_t *prefix,
+    ngx_http_cache_purge_index_hit_t *after,
+    ngx_http_cache_purge_index_hit_t *hits, ngx_uint_t max, ngx_pool_t *pool,
+    ngx_flag_t *more)
+{
+    ngx_http_cache_purge_index_sh_t    *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_http_cache_purge_index_node_t  *n, *next;
+    ngx_uint_t                          i;
+
+    *more = 0;
+
+    /* from the start of the range, or strictly after the last one taken:
+     * entries put back (see index_delete) are not taken again */
+    n = (after != NULL)
+        ? ngx_http_cache_purge_index_bound(sh, id, after->key.data,
+                                           after->key.len, after->md5, 1)
+        : ngx_http_cache_purge_index_bound(sh, id, prefix->data,
+                                           prefix->len,
+                                           ngx_http_cache_purge_zero_md5, 0);
+
+    for (i = 0; ngx_http_cache_purge_index_in_range(n, id, prefix); i++) {
+
+        if (i == max) {
+            *more = 1;
+            break;
+        }
+
+        next = (ngx_http_cache_purge_index_node_t *)
+                   ngx_rbtree_next(&sh->rbtree, &n->node);
+
+        ngx_memcpy(hits[i].md5, n->md5, NGX_HTTP_CACHE_KEY_LEN);
+
+        hits[i].key.data = ngx_pnalloc(pool, n->len);
+        hits[i].key.len  = (hits[i].key.data != NULL) ? n->len : 0;
+
+        if (hits[i].key.data != NULL) {
+            ngx_memcpy(hits[i].key.data, n->key, n->len);
+        }
+
+        ngx_http_cache_purge_index_remove(cmcf, n);
+
+        n = next;
+    }
+
+    return i;
+}
+
+/*
+ * Delete the cache file named by md5.  NGX_OK deleted, NGX_DECLINED not
+ * there (expired, or still being stored), NGX_ERROR otherwise.
+ */
+static ngx_int_t
+ngx_http_cache_purge_delete_md5(ngx_http_file_cache_t *cache, u_char *md5,
+    ngx_log_t *log)
+{
+    ngx_str_t  path;
+    size_t     len;
+    u_char    *p, name[NGX_MAX_PATH];
+
+    len = cache->path->name.len + 1 + cache->path->len
+          + 2 * NGX_HTTP_CACHE_KEY_LEN;
+
+    if (len >= NGX_MAX_PATH) {
+        return NGX_ERROR;
+    }
+
+    /* the layout of ngx_http_file_cache_name() */
+    p = ngx_cpymem(name, cache->path->name.data, cache->path->name.len);
+    p += 1 + cache->path->len;
+    p = ngx_hex_dump(p, md5, NGX_HTTP_CACHE_KEY_LEN);
+    *p = '\0';
+
+    ngx_create_hashed_filename(cache->path, name, len);
+
+    path.data = name;
+    path.len  = len;
+
+    ngx_http_cache_purge_invalidate_node(cache, &path);
+
+    if (ngx_delete_file(name) == NGX_FILE_ERROR) {
+
+        if (ngx_errno == NGX_ENOENT) {
+            return NGX_DECLINED;
+        }
+
+        ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                      "ngx_cache_purge: could not delete \"%s\"", name);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+/* Delete the files of taken entries; returns how many were deleted */
+static ngx_uint_t
+ngx_http_cache_purge_index_delete(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_file_cache_t *cache, ngx_rbtree_key_t id, ngx_uint_t generation,
+    ngx_http_cache_purge_index_hit_t *hits, ngx_uint_t n, ngx_log_t *log)
+{
+    ngx_http_cache_purge_index_sh_t  *sh;
+    ngx_http_file_cache_node_t       *fcn;
+    ngx_flag_t                        pending, stored;
+    ngx_uint_t                        i, deleted;
+    ngx_int_t                         rc;
+
+    deleted = 0;
+
+    for (i = 0; i < n; i++) {
+
+        rc = ngx_http_cache_purge_delete_md5(cache, hits[i].md5, log);
+
+        if (rc == NGX_OK) {
+            deleted++;
+            continue;
+        }
+
+        /*
+         * Not there.  If a response for it is still being stored (entries
+         * are recorded before the file exists; the storing request holds
+         * the zone's node), put the entry back so a later purge finds the
+         * file.  Otherwise the entry was stale (expired, purged exactly):
+         * leave it out.
+         */
+        if (rc == NGX_DECLINED && hits[i].key.len > 0) {
+
+            ngx_shmtx_lock(&cache->shpool->mutex);
+            fcn = ngx_http_cache_purge_lookup_node(cache, hits[i].md5);
+            stored  = (fcn != NULL && fcn->exists);
+            pending = (fcn != NULL && (fcn->count != 0 || fcn->updating));
+            ngx_shmtx_unlock(&cache->shpool->mutex);
+
+            /* the store finished in between: the file is there now */
+            if (stored
+                && ngx_http_cache_purge_delete_md5(cache, hits[i].md5, log)
+                   == NGX_OK)
+            {
+                deleted++;
+                continue;
+            }
+
+            if (!stored && !pending) {
+                continue;
+            }
+
+            sh = ngx_http_cache_purge_index_lock(cmcf);
+
+            /* not into an index that was reset meanwhile: ids differ */
+            if (sh != NULL && sh->generation == generation
+                && ngx_http_cache_purge_index_insert(cmcf, id,
+                                                     hits[i].key.data,
+                                                     hits[i].key.len,
+                                                     hits[i].md5)
+                   == NGX_ERROR)
+            {
+                ngx_http_cache_purge_index_lost(cmcf, log,
+                                            "cache_purge_index zone is full, increase cache_purge_index");
+            }
+
+            ngx_http_cache_purge_index_unlock(cmcf);
+        }
+    }
+
+    return deleted;
+}
+
+/* Remember a purge for the build walk (files it has not reached).  Locked. */
+static ngx_int_t
+ngx_http_cache_purge_index_build_add(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_rbtree_key_t id, ngx_str_t *prefix)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+    u_char                           *p;
+
+    if (sh->build == NULL) {
+        sh->build = ngx_slab_alloc_locked(cmcf->index_shpool,
+                        NGX_CACHE_PURGE_INDEX_BUILD_MAX
+                        * sizeof(ngx_http_cache_purge_build_pattern_t));
+        if (sh->build == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (sh->nbuild == NGX_CACHE_PURGE_INDEX_BUILD_MAX) {
+        return NGX_ERROR;
+    }
+
+    p = NULL;
+
+    if (prefix->len > 0) {
+        p = ngx_slab_alloc_locked(cmcf->index_shpool, prefix->len);
+        if (p == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(p, prefix->data, prefix->len);
+    }
+
+    sh->build[sh->nbuild].prefix.data = p;
+    sh->build[sh->nbuild].prefix.len  = prefix->len;
+    sh->build[sh->nbuild].id          = id;
+    sh->nbuild++;
+    sh->build_version++;
+
+    return NGX_OK;
+}
+
+/* Build walk finished or given up: forget its purges.  Locked. */
+static void
+ngx_http_cache_purge_index_build_clear(ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_uint_t                        i;
+
+    if (sh->build == NULL) {
+        return;
+    }
+
+    for (i = 0; i < sh->nbuild; i++) {
+        if (sh->build[i].prefix.data != NULL) {
+            ngx_slab_free_locked(cmcf->index_shpool,
+                                 sh->build[i].prefix.data);
+        }
+    }
+
+    ngx_slab_free_locked(cmcf->index_shpool, sh->build);
+
+    sh->build  = NULL;
+    sh->nbuild = 0;
+    sh->build_version++;
+}
+
+/*
+ * A wildcard or purge_all request, answered from the index.  NGX_DONE: the
+ * request has been answered.  NGX_DECLINED: the index cannot be used right
+ * now (never built, full, ...); the caller walks instead.
+ *
+ * Up to cache_purge_index_sync_limit matching files are deleted right away
+ * and the answer is 200 (or the usual not-found code).  A purge that matches
+ * more is continued in the background and answered 202, as is any purge
+ * while the build walk still has files to look at.
+ */
+static ngx_int_t
+ngx_http_cache_purge_index_purge(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all)
+{
+    ngx_http_cache_purge_main_conf_t  *cmcf;
+    ngx_http_cache_purge_index_hit_t  *hits;
+    ngx_str_t                          prefix, status;
+    ngx_http_cache_purge_index_sh_t   *sh;
+    ngx_uint_t                         state, n, deleted, generation;
+    ngx_int_t                          id, rc;
+    ngx_flag_t                         more;
+
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
+
+    if (cmcf == NULL || cmcf->index_shpool == NULL
+        || cmcf->queue_shpool == NULL)
+    {
+        return NGX_DECLINED;
+    }
+
+    prefix.len = purge_all ? 0 : key->len;
+
+    if (prefix.len > 0 && key->data[prefix.len - 1] == '*') {
+        prefix.len--;
+    }
+
+    if (prefix.len >= NGX_CACHE_PURGE_KEY_MAX_LEN) {
+        return NGX_DECLINED;
+    }
+
+    prefix.data = ngx_pnalloc(r->pool, prefix.len + 1);
+    hits = ngx_palloc(r->pool, cmcf->index_sync_limit
+                               * sizeof(ngx_http_cache_purge_index_hit_t));
+
+    if (prefix.data == NULL || hits == NULL) {
+        return NGX_DECLINED;
+    }
+
+    ngx_strlow(prefix.data, key->data, prefix.len);
+
+    sh = ngx_http_cache_purge_index_lock(cmcf);
+
+    state      = (sh != NULL) ? sh->state : NGX_CACHE_PURGE_INDEX_FAILED;
+    generation = (sh != NULL) ? sh->generation : 0;
+
+    if (state != NGX_CACHE_PURGE_INDEX_READY
+        && state != NGX_CACHE_PURGE_INDEX_BUILDING)
+    {
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_DECLINED;
+    }
+
+    /* while building, the purge must also reach the files not yet walked */
+    id = ngx_http_cache_purge_index_cache_id(cmcf, &cache->path->name,
+                                     state == NGX_CACHE_PURGE_INDEX_BUILDING);
+
+    if (state == NGX_CACHE_PURGE_INDEX_BUILDING
+        && (id == NGX_ERROR
+            || ngx_http_cache_purge_index_build_add(cmcf,
+                                                    (ngx_rbtree_key_t) id,
+                                                    &prefix)
+               != NGX_OK))
+    {
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_DECLINED;
+    }
+
+    n = 0;
+    more = 0;
+
+    if (id != NGX_ERROR) {
+        n = ngx_http_cache_purge_index_take(cmcf, (ngx_rbtree_key_t) id,
+                                            &prefix, NULL, hits,
+                                            cmcf->index_sync_limit, r->pool,
+                                            &more);
+    }
+
+    ngx_http_cache_purge_index_unlock(cmcf);
+
+    deleted = ngx_http_cache_purge_index_delete(cmcf, cache,
+                                                (ngx_rbtree_key_t) id,
+                                                generation, hits, n,
+                                                r->connection->log);
+
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ngx_cache_purge: index purge \"%V\" took %ui entries, "
+                   "deleted %ui file(s), more: %i", &prefix, n, deleted, more);
+
+    r->main->count++;
+
+    if (more) {
+        rc = ngx_http_cache_purge_enqueue_raw(cmcf, r->connection->log,
+                                              &cache->path->name, key,
+                                              purge_all,
+                                              NGX_CACHE_PURGE_MODE_INDEX);
+        if (rc != NGX_OK) {
+            /* partly done; a retry carries on from what is left */
+            ngx_http_finalize_request(r, NGX_HTTP_TOO_MANY_REQUESTS);
+            return NGX_DONE;
+        }
+    }
+
+    if (more || state == NGX_CACHE_PURGE_INDEX_BUILDING) {
+        r->headers_out.status = NGX_HTTP_ACCEPTED;
+        ngx_str_set(&status, "queued");
+        ngx_http_finalize_request(r,
+            ngx_http_cache_purge_send_response(r, &status));
+        return NGX_DONE;
+    }
+
+    if (deleted == 0) {
+        ngx_http_finalize_request(r, cmcf->legacy_status_codes
+                                     ? NGX_HTTP_PRECONDITION_FAILED
+                                     : NGX_HTTP_NOT_FOUND);
+        return NGX_DONE;
+    }
+
+    ngx_str_set(&status, "purged");
+    ngx_http_finalize_request(r,
+        ngx_http_cache_purge_send_response(r, &status));
+
+    return NGX_DONE;
+}
+
+/*
+ * Background part of an index purge (a queued pass in index mode): take and
+ * delete matching entries batch by batch.  NGX_OK done, NGX_AGAIN budget ran
+ * out, NGX_DECLINED the index became unusable (the pass walks instead).
+ */
+static ngx_int_t
+ngx_http_cache_purge_index_pass(ngx_http_cache_purge_pass_t *pass,
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_msec_t budget)
+{
+    ngx_http_cache_purge_patterns_t  *pats = &pass->scan.pats;
+    ngx_str_t                        *prefix, all = ngx_null_string;
+    ngx_uint_t                        n, npats, state;
+    ngx_int_t                         id;
+    ngx_flag_t                        more;
+    ngx_pool_t                       *tmp;
+    ngx_msec_t                        start;
+    ngx_http_cache_purge_index_sh_t  *sh;
+    ngx_uint_t                        generation;
+
+    if (pass->scan.cache == NULL) {
+        return NGX_DECLINED;
+    }
+
+    npats = pats->match_all ? 1 : pats->nelts;
+    start = ngx_current_msec;
+
+    while (pass->next_pattern < npats) {
+
+        prefix = pats->match_all ? &all : &pats->elts[pass->next_pattern];
+
+        tmp = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, pass->scan.log);
+        if (tmp == NULL) {
+            return NGX_AGAIN;
+        }
+
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+
+        state = (sh != NULL) ? sh->state : NGX_CACHE_PURGE_INDEX_FAILED;
+
+        if (state != NGX_CACHE_PURGE_INDEX_READY
+            && state != NGX_CACHE_PURGE_INDEX_BUILDING)
+        {
+            ngx_http_cache_purge_index_unlock(cmcf);
+            ngx_destroy_pool(tmp);
+            return NGX_DECLINED;
+        }
+
+        generation = sh->generation;
+
+        id = ngx_http_cache_purge_index_cache_id(cmcf,
+                                                 &pass->scan.cache->path->name,
+                                                 0);
+        n = 0;
+        more = 0;
+
+        if (id != NGX_ERROR) {
+            n = ngx_http_cache_purge_index_take(cmcf, (ngx_rbtree_key_t) id,
+                                                prefix,
+                                                pass->has_cursor
+                                                ? &pass->cursor : NULL,
+                                                pass->hits,
+                                                cmcf->index_sync_limit, tmp,
+                                                &more);
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+
+        pass->scan.files_checked += n;
+        pass->scan.files_deleted += ngx_http_cache_purge_index_delete(cmcf,
+                                        pass->scan.cache,
+                                        (ngx_rbtree_key_t) id, generation,
+                                        pass->hits, n, pass->scan.log);
+
+        if (n > 0 && pass->hits[n - 1].key.len > 0) {
+            pass->cursor.key.len = pass->hits[n - 1].key.len;
+            ngx_memcpy(pass->cursor_key, pass->hits[n - 1].key.data,
+                       pass->cursor.key.len);
+            ngx_memcpy(pass->cursor.md5, pass->hits[n - 1].md5,
+                       NGX_HTTP_CACHE_KEY_LEN);
+            pass->cursor.key.data = pass->cursor_key;
+            pass->has_cursor = 1;
+        }
+
+        ngx_destroy_pool(tmp);
+
+        if (!more) {
+            pass->next_pattern++;
+            pass->has_cursor = 0;
+        }
+
+        if (budget != 0) {
+            ngx_time_update();
+
+            if (ngx_current_msec - start >= budget) {
+                return (pass->next_pattern < npats) ? NGX_AGAIN : NGX_OK;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+/* -- key index: build walk and reconcile (worker 0 only) ------------------- */
+
+static void
+ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b)
+{
+    ngx_http_cache_purge_scan_close(&b->scan);
+
+    if (b->snap_pool != NULL) {
+        ngx_destroy_pool(b->snap_pool);
+    }
+
+    if (b->pool != NULL) {
+        ngx_destroy_pool(b->pool);
+    }
+
+    ngx_memzero(b, sizeof(ngx_http_cache_purge_build_t));
+}
+
+static ngx_int_t
+ngx_http_cache_purge_build_start(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_build_t *b, ngx_uint_t generation)
+{
+    ngx_list_part_t         *part;
+    ngx_shm_zone_t          *zone;
+    ngx_http_file_cache_t   *cache, **pc;
+    ngx_uint_t               i;
+
+    ngx_memzero(b, sizeof(ngx_http_cache_purge_build_t));
+
+    b->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, cycle->log);
+    if (b->pool == NULL
+        || ngx_array_init(&b->caches, b->pool, 4,
+                          sizeof(ngx_http_file_cache_t *)) != NGX_OK)
+    {
+        ngx_http_cache_purge_build_end(b);
+        return NGX_ERROR;
+    }
+
+    part = &cycle->shared_memory.part;
+    zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            zone = part->elts;
+            i = 0;
+        }
+
+        cache = ngx_http_cache_purge_zone_cache(&zone[i]);
+
+        if (cache != NULL && cache->path != NULL) {
+            pc = ngx_array_push(&b->caches);
+            if (pc == NULL) {
+                ngx_http_cache_purge_build_end(b);
+                return NGX_ERROR;
+            }
+            *pc = cache;
+        }
+    }
+
+    b->scan.log   = cycle->log;
+    b->version    = (ngx_uint_t) -1;
+    b->started    = ngx_current_msec;
+    b->generation = generation;
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "ngx_cache_purge: building the key index of %ui cache(s)",
+                  b->caches.nelts);
+
+    return NGX_OK;
+}
+
+/* Take a fresh copy of the purges received during the build.  Locked. */
+static ngx_int_t
+ngx_http_cache_purge_build_snapshot(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_build_t *b)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_str_t                        *copy;
+    ngx_uint_t                        i, n;
+
+    if (b->snap_pool != NULL) {
+        ngx_destroy_pool(b->snap_pool);
+    }
+
+    ngx_memzero(&b->snap, sizeof(ngx_http_cache_purge_patterns_t));
+
+    b->snap_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, b->scan.log);
+    if (b->snap_pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (sh->nbuild > 0) {
+        copy = ngx_palloc(b->snap_pool, sh->nbuild * sizeof(ngx_str_t));
+        if (copy == NULL) {
+            return NGX_ERROR;
+        }
+
+        for (i = 0, n = 0; i < sh->nbuild; i++) {
+
+            if (sh->build[i].id != b->id) {
+                continue;               /* a purge of another cache */
+            }
+
+            copy[n].len  = sh->build[i].prefix.len;
+            copy[n].data = ngx_pnalloc(b->snap_pool, copy[n].len + 1);
+            if (copy[n].data == NULL) {
+                return NGX_ERROR;
+            }
+            ngx_memcpy(copy[n].data, sh->build[i].prefix.data, copy[n].len);
+            n++;
+        }
+
+        if (n > 0) {
+            (void) ngx_http_cache_purge_patterns_init(&b->snap, copy, n,
+                                                      b->scan.log);
+        }
+    }
+
+    b->version = sh->build_version;
+    b->snap_id = b->id;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_unhex(u_char *p, u_char *md5)
+{
+    ngx_int_t   hi, lo;
+    ngx_uint_t  i;
+
+    for (i = 0; i < NGX_HTTP_CACHE_KEY_LEN; i++) {
+        hi = ngx_hextoi(p + 2 * i, 1);
+        lo = ngx_hextoi(p + 2 * i + 1, 1);
+
+        if (hi == NGX_ERROR || lo == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        md5[i] = (u_char) (hi << 4 | lo);
+    }
+
+    return NGX_OK;
+}
+
+/*
+ * One slice of the build walk.  Files are read in batches outside the lock;
+ * each batch is then, under the lock, either indexed or (when a purge that
+ * arrived during the build matches) deleted.  Checking and indexing under
+ * the same lock the purges take is what makes "applied to the index so far
+ * + remembered for the rest of the walk" exact.
+ *
+ * NGX_OK the build is complete, NGX_AGAIN budget ran out, NGX_DONE it was
+ * abandoned (the index failed meanwhile).
+ */
+static ngx_int_t
+ngx_http_cache_purge_build_step(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_build_t *b, ngx_msec_t budget)
+{
+    static u_char             keys[NGX_CACHE_PURGE_INDEX_BATCH]
+                                  [NGX_CACHE_PURGE_KEY_MAX_LEN];
+    static size_t             lens[NGX_CACHE_PURGE_INDEX_BATCH];
+    static u_char             md5s[NGX_CACHE_PURGE_INDEX_BATCH]
+                                  [NGX_HTTP_CACHE_KEY_LEN];
+    static u_char             del[NGX_CACHE_PURGE_INDEX_BATCH];
+    ngx_http_file_cache_t   **caches;
+    ngx_str_t                 name;
+    ngx_uint_t                i, n;
+    ngx_int_t                 id, rc;
+    ngx_msec_t                start;
+    ngx_flag_t                failed, walked;
+    ssize_t                   len;
+    u_char                   *nl;
+    int                       dir_fd;
+    ngx_http_cache_purge_index_sh_t  *sh;
+
+    start  = ngx_current_msec;
+    caches = b->caches.elts;
+
+    for ( ;; ) {
+
+        if (b->cache == NULL) {
+
+            if (b->next_cache == b->caches.nelts) {
+                return NGX_OK;
+            }
+
+            b->cache = caches[b->next_cache++];
+
+            /*
+             * A cache directory that cannot be listed cannot be indexed:
+             * the index would claim to be complete without its files.
+             */
+            rc = ngx_http_cache_purge_scan_open(&b->scan,
+                                                &b->cache->path->name);
+
+            sh = ngx_http_cache_purge_index_lock(cmcf);
+
+            if (sh == NULL || sh->generation != b->generation) {
+                ngx_http_cache_purge_index_unlock(cmcf);
+                return NGX_DONE;
+            }
+
+            id = (rc == NGX_OK)
+                 ? ngx_http_cache_purge_index_cache_id(cmcf,
+                                                  &b->cache->path->name, 1)
+                 : NGX_ERROR;
+
+            if (id == NGX_ERROR) {
+                ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
+                                    (rc != NGX_OK)
+                                    ? "a cache directory could not be read"
+                                    : "cache_purge_index zone is full, "
+                                      "increase cache_purge_index");
+            }
+
+            ngx_http_cache_purge_index_unlock(cmcf);
+
+            if (id == NGX_ERROR) {
+                return NGX_DONE;
+            }
+
+            b->id = (ngx_rbtree_key_t) id;
+        }
+
+        /* read a batch */
+
+        walked = 0;
+
+        for (n = 0; n < NGX_CACHE_PURGE_INDEX_BATCH; /* void */ ) {
+
+            if (ngx_http_cache_purge_scan_next(&b->scan, &dir_fd, &name)
+                != NGX_OK)
+            {
+                walked = 1;
+                break;
+            }
+
+            if (ngx_http_cache_purge_unhex(name.data, md5s[n]) != NGX_OK) {
+                continue;
+            }
+
+            len = ngx_http_cache_purge_read_key(dir_fd, (char *) name.data,
+                                                keys[n],
+                                                NGX_CACHE_PURGE_KEY_MAX_LEN);
+            if (len <= 0) {
+                continue;
+            }
+
+            nl = ngx_strlchr(keys[n], keys[n] + len, LF);
+            lens[n] = (nl != NULL) ? (size_t) (nl - keys[n])
+                                   : ngx_min((size_t) len,
+                                             NGX_CACHE_PURGE_KEY_MAX_LEN - 1);
+
+            ngx_strlow(keys[n], keys[n], lens[n]);
+            n++;
+        }
+
+        /* index it, or delete what a purge during the build matches */
+
+        failed = 0;
+
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+
+        if (b->scan.errors != 0
+            && sh != NULL && sh->generation == b->generation)
+        {
+            /* files under a directory the walk could not read are unknown */
+            ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
+                                    "a cache directory could not be read");
+            ngx_http_cache_purge_index_unlock(cmcf);
+            return NGX_DONE;
+        }
+
+        if (sh == NULL
+            || sh->state != NGX_CACHE_PURGE_INDEX_BUILDING
+            || sh->generation != b->generation)
+        {
+            ngx_http_cache_purge_index_unlock(cmcf);
+            return NGX_DONE;
+        }
+
+        if ((b->version != sh->build_version || b->snap_id != b->id)
+            && ngx_http_cache_purge_build_snapshot(cmcf, b) != NGX_OK)
+        {
+            /* cannot tell which files the build purges must delete */
+            ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
+                                            "out of memory");
+            ngx_http_cache_purge_index_unlock(cmcf);
+            return NGX_DONE;
+        }
+
+        for (i = 0; i < n; i++) {
+
+            del[i] = (b->snap.match_all || b->snap.nelts > 0)
+                     && ngx_http_cache_purge_patterns_match(&b->snap, keys[i],
+                                                            lens[i]);
+            if (del[i]) {
+                continue;
+            }
+
+            rc = ngx_http_cache_purge_index_insert(cmcf, b->id, keys[i],
+                                                   lens[i], md5s[i]);
+            if (rc == NGX_ERROR) {
+                ngx_http_cache_purge_index_lost(cmcf, b->scan.log,
+                                            "cache_purge_index zone is full, increase cache_purge_index");
+                failed = 1;
+                break;
+            }
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+
+        if (failed) {
+            return NGX_DONE;
+        }
+
+        for (i = 0; i < n; i++) {
+            if (del[i]
+                && ngx_http_cache_purge_delete_md5(b->cache, md5s[i],
+                                                   b->scan.log) == NGX_OK)
+            {
+                b->deleted++;
+            }
+        }
+
+        b->files += n;
+
+        if (walked) {
+            ngx_http_cache_purge_scan_close(&b->scan);
+            b->cache = NULL;
+        }
+
+        if (budget != 0) {
+            ngx_time_update();
+
+            if (ngx_current_msec - start >= budget) {
+                return NGX_AGAIN;
+            }
+        }
+    }
+}
+
+/*
+ * Find a cache zone's node by the 16-byte cache key.  Mirrors
+ * ngx_http_file_cache_lookup(): node.key is the first sizeof(ngx_rbtree_key_t)
+ * bytes of the key copied in native byte order (8 bytes on 64-bit), and
+ * fcn->key holds the rest.  Cache zone locked.
+ */
+static ngx_http_file_cache_node_t *
+ngx_http_cache_purge_lookup_node(ngx_http_file_cache_t *cache, u_char *key16)
+{
+    ngx_rbtree_node_t           *node, *sentinel;
+    ngx_http_file_cache_node_t  *fcn;
+    ngx_rbtree_key_t             node_key;
+    ngx_int_t                    rc;
+
+    ngx_memcpy((u_char *) &node_key, key16, sizeof(ngx_rbtree_key_t));
+
+    node     = cache->sh->rbtree.root;
+    sentinel = cache->sh->rbtree.sentinel;
+
+    while (node != sentinel) {
+
+        if (node_key < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (node_key > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        fcn = (ngx_http_file_cache_node_t *) node;
+
+        rc = ngx_memcmp(&key16[sizeof(ngx_rbtree_key_t)], fcn->key,
+                        NGX_HTTP_CACHE_KEY_LEN - sizeof(ngx_rbtree_key_t));
+
+        if (rc == 0) {
+            return fcn;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    return NULL;
+}
+
+/*
+ * One slice of the reconcile pass: walk the index in key order and drop
+ * entries whose cache node is gone (the cache manager expired or evicted the
+ * file), or holds no file and nobody is storing one.  Zones whose cache
+ * loader has not finished (cold) are left alone: their nodes are not all
+ * there yet.  NGX_OK the pass is complete, NGX_AGAIN budget ran out.
+ */
+static ngx_int_t
+ngx_http_cache_purge_reconcile_step(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_reconcile_t *rc, ngx_msec_t budget)
+{
+    ngx_http_cache_purge_index_sh_t    *sh;
+    ngx_http_cache_purge_index_node_t  *n, *next;
+    ngx_http_file_cache_node_t         *fcn;
+    ngx_http_file_cache_t              *cache;
+    ngx_rbtree_node_t                  *root;
+    ngx_uint_t                          i, id;
+    ngx_msec_t                          start, last;
+    ngx_flag_t                          drop;
+
+    start = ngx_current_msec;
+
+    for ( ;; ) {
+
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+
+        if (sh == NULL || (rc->active && rc->generation != sh->generation)) {
+            /* the index was reset: nothing of this pass applies any more */
+            ngx_http_cache_purge_index_unlock(cmcf);
+            rc->active = 0;
+            return NGX_OK;
+        }
+
+        if (!rc->active) {
+            last = rc->last;
+            ngx_memzero(rc, sizeof(ngx_http_cache_purge_reconcile_t));
+            rc->last       = last;
+            rc->active     = 1;
+            rc->started    = ngx_current_msec;
+            rc->generation = sh->generation;
+
+            /* ids are indexes into sh->paths; resolve them once per pass */
+            for (i = 0; i < sh->npaths; i++) {
+                rc->caches[i] = ngx_http_cache_purge_find_cache(cycle,
+                                                                &sh->paths[i]);
+            }
+            rc->npaths = sh->npaths;
+        }
+
+        if (rc->has_cursor) {
+            n = ngx_http_cache_purge_index_bound(sh, rc->id, rc->key, rc->len,
+                                                 rc->md5, 1);
+        } else {
+            root = sh->rbtree.root;
+            n = (root == sh->rbtree.sentinel) ? NULL
+                : (ngx_http_cache_purge_index_node_t *)
+                      ngx_rbtree_min(root, sh->rbtree.sentinel);
+        }
+
+        for (i = 0; n != NULL && i < NGX_CACHE_PURGE_INDEX_SLICE; i++) {
+
+            next = (ngx_http_cache_purge_index_node_t *)
+                       ngx_rbtree_next(&sh->rbtree, &n->node);
+
+            rc->id  = n->node.key;
+            rc->len = n->len;
+            ngx_memcpy(rc->key, n->key, n->len);
+            ngx_memcpy(rc->md5, n->md5, NGX_HTTP_CACHE_KEY_LEN);
+            rc->has_cursor = 1;
+
+            id    = (ngx_uint_t) n->node.key;
+            cache = (id < rc->npaths) ? rc->caches[id] : NULL;
+            drop  = 0;
+
+            if (cache == NULL) {
+                /* the cache is no longer configured */
+                drop = (id < rc->npaths);
+
+            } else if (!cache->sh->cold) {
+                ngx_shmtx_lock(&cache->shpool->mutex);
+
+                fcn = ngx_http_cache_purge_lookup_node(cache, n->md5);
+
+                drop = (fcn == NULL
+                        || (!fcn->exists && fcn->count == 0
+                            && !fcn->updating));
+
+                ngx_shmtx_unlock(&cache->shpool->mutex);
+            }
+
+            rc->checked++;
+
+            if (drop) {
+                ngx_http_cache_purge_index_remove(cmcf, n);
+                rc->dropped++;
+            }
+
+            n = next;
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+
+        if (n == NULL) {
+            ngx_time_update();
+            ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
+                          "ngx_cache_purge: index reconciled: checked %ui, "
+                          "dropped %ui, %ui entries, in %Mms", rc->checked,
+                          rc->dropped, sh->entries,
+                          ngx_current_msec - rc->started);
+            rc->active = 0;
+            return NGX_OK;
+        }
+
+        if (budget != 0) {
+            ngx_time_update();
+
+            if (ngx_current_msec - start >= budget) {
+                return NGX_AGAIN;
+            }
+        }
+    }
+}
+
+/*
+ * Index upkeep for the drainer: build it after a (re)start, rebuild it after
+ * it ran full, and reconcile it periodically.  NGX_AGAIN work remains,
+ * NGX_OK nothing to do right now.
+ */
+/*
+ * The purges a build had registered, copied out (locked) so they can be
+ * handed to the walk queue when the build is abandoned.  Elements are
+ * { cache path, key } pairs; an empty key stands for purge_all.
+ */
+static ngx_array_t *
+ngx_http_cache_purge_build_handoff(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_pool_t *pool)
+{
+    ngx_http_cache_purge_index_sh_t  *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_array_t                      *a;
+    ngx_str_t                        *e;
+    ngx_uint_t                        i;
+    ngx_rbtree_key_t                  id;
+
+    a = ngx_array_create(pool, sh->nbuild * 2, sizeof(ngx_str_t));
+    if (a == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < sh->nbuild; i++) {
+        id = sh->build[i].id;
+
+        if (id >= sh->npaths) {
+            continue;
+        }
+
+        e = ngx_array_push_n(a, 2);
+        if (e == NULL) {
+            return a;
+        }
+
+        e[0].len  = sh->paths[id].len;
+        e[0].data = ngx_pnalloc(pool, e[0].len + 1);
+
+        /* the queue expects the wildcard form of the key */
+        e[1].len  = sh->build[i].prefix.len
+                    + (sh->build[i].prefix.len > 0 ? 1 : 0);
+        e[1].data = ngx_pnalloc(pool, e[1].len + 1);
+
+        if (e[0].data == NULL || e[1].data == NULL) {
+            a->nelts -= 2;
+            return a;
+        }
+
+        ngx_memcpy(e[0].data, sh->paths[id].data, e[0].len);
+        e[0].data[e[0].len] = '\0';
+
+        ngx_memcpy(e[1].data, sh->build[i].prefix.data,
+                   sh->build[i].prefix.len);
+        if (e[1].len > 0) {
+            e[1].data[e[1].len - 1] = '*';
+        }
+    }
+
+    return a;
+}
+
+static void
+ngx_http_cache_purge_build_requeue(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_log_t *log, ngx_array_t *handoff)
+{
+    ngx_str_t   *e = handoff->elts;
+    ngx_uint_t   i, lost, level;
+
+    lost = 0;
+
+    for (i = 0; i + 1 < handoff->nelts; i += 2) {
+        if (ngx_http_cache_purge_enqueue_raw(cmcf, log, &e[i], &e[i + 1],
+                                             e[i + 1].len == 0,
+                                             NGX_CACHE_PURGE_MODE_WALK)
+            != NGX_OK)
+        {
+            lost++;
+        }
+    }
+
+    level = lost ? NGX_LOG_CRIT : NGX_LOG_NOTICE;
+
+    ngx_log_error(level, log, 0,
+                  "ngx_cache_purge: %ui purge(s) received during the "
+                  "abandoned index build handed to walks, %ui lost "
+                  "(queue full)", handoff->nelts / 2, lost);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_index_work(ngx_cycle_t *cycle,
+    ngx_http_cache_purge_main_conf_t *cmcf)
+{
+    ngx_http_cache_purge_build_t      *b = &ngx_cache_purge_build;
+    ngx_http_cache_purge_reconcile_t  *rc = &ngx_cache_purge_reconcile;
+    ngx_http_cache_purge_index_sh_t   *sh;
+    ngx_uint_t                         state, level, generation, entries;
+    ngx_array_t                       *handoff;
+    ngx_int_t                          r;
+
+    if (cmcf->index_shpool == NULL || ngx_exiting) {
+        return NGX_OK;
+    }
+
+    sh = ngx_http_cache_purge_index_lock(cmcf);
+
+    if (sh == NULL) {
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_OK;
+    }
+
+    state      = sh->state;
+    generation = sh->generation;
+
+    switch (state) {
+
+    case NGX_CACHE_PURGE_INDEX_PENDING:
+        sh->state = NGX_CACHE_PURGE_INDEX_BUILDING;
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_AGAIN;
+
+    case NGX_CACHE_PURGE_INDEX_FAILED:
+
+        /* self-heal: after a while reconcile (frees room) and build again */
+        if (ngx_current_msec - sh->failed_at >= cmcf->index_reconcile) {
+            sh->state = NGX_CACHE_PURGE_INDEX_REBUILD;
+            ngx_http_cache_purge_index_unlock(cmcf);
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "ngx_cache_purge: retrying the key index");
+            return NGX_AGAIN;
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+        return NGX_OK;
+
+    default:
+        ngx_http_cache_purge_index_unlock(cmcf);
+        break;
+    }
+
+    switch (state) {
+
+    case NGX_CACHE_PURGE_INDEX_BUILDING:
+
+        /* a build of an index that was reset since is useless */
+        if (b->pool != NULL && b->generation != generation) {
+            ngx_http_cache_purge_build_end(b);
+        }
+
+        /* also after a reload or a reset: worker 0 starts the walk over */
+        if (b->pool == NULL
+            && ngx_http_cache_purge_build_start(cycle, b, generation)
+               != NGX_OK)
+        {
+            return NGX_AGAIN;
+        }
+
+        r = ngx_http_cache_purge_build_step(cmcf, b, cmcf->walk_budget);
+
+        if (r == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+        entries = 0;
+        handoff = NULL;
+
+        if (sh != NULL && sh->generation == b->generation) {
+
+            if (r == NGX_OK && sh->state == NGX_CACHE_PURGE_INDEX_BUILDING) {
+                sh->state = NGX_CACHE_PURGE_INDEX_READY;
+
+            } else if (sh->nbuild > 0) {
+                /* abandoned: its purges have not reached every file */
+                handoff = ngx_http_cache_purge_build_handoff(cmcf, b->pool);
+            }
+
+            ngx_http_cache_purge_index_build_clear(cmcf);
+            entries = sh->entries;
+        }
+
+        ngx_http_cache_purge_index_unlock(cmcf);
+
+        if (handoff != NULL) {
+            ngx_http_cache_purge_build_requeue(cmcf, cycle->log, handoff);
+        }
+
+        ngx_time_update();
+
+        level = (r == NGX_OK) ? NGX_LOG_NOTICE : NGX_LOG_ERR;
+
+        ngx_log_error(level, cycle->log, 0,
+                      "ngx_cache_purge: key index build %s: %ui file(s) "
+                      "read, %ui purged, %ui entries, in %Mms",
+                      r == NGX_OK ? "complete" : "abandoned", b->files,
+                      b->deleted, entries, ngx_current_msec - b->started);
+
+        ngx_http_cache_purge_build_end(b);
+        rc->last = ngx_current_msec;
+
+        return NGX_AGAIN;
+
+    case NGX_CACHE_PURGE_INDEX_REBUILD:
+
+        /* make room by dropping stale entries, then walk again */
+        if (ngx_http_cache_purge_reconcile_step(cycle, cmcf, rc,
+                                                cmcf->walk_budget)
+            == NGX_AGAIN)
+        {
+            return NGX_AGAIN;
+        }
+
+        sh = ngx_http_cache_purge_index_lock(cmcf);
+        if (sh != NULL && sh->state == NGX_CACHE_PURGE_INDEX_REBUILD) {
+            sh->state = NGX_CACHE_PURGE_INDEX_BUILDING;
+        }
+        ngx_http_cache_purge_index_unlock(cmcf);
+
+        return NGX_AGAIN;
+
+    case NGX_CACHE_PURGE_INDEX_READY:
+
+        if (!rc->active
+            && ngx_current_msec - rc->last < cmcf->index_reconcile)
+        {
+            return NGX_OK;
+        }
+
+        if (ngx_http_cache_purge_reconcile_step(cycle, cmcf, rc,
+                                                cmcf->walk_budget)
+            == NGX_OK)
+        {
+            rc->last = ngx_current_msec;
+        }
+
+        return NGX_AGAIN;
+
+    default:
+        return NGX_OK;
+    }
+}
+
+/*
+ * Header filter: an upstream response is about to be sent (and possibly
+ * stored).  Runs for subrequests too, unlike the log phase.
+ */
+static ngx_http_output_header_filter_pt  ngx_http_cache_purge_next_header_filter;
+
+static ngx_int_t
+ngx_http_cache_purge_header_filter(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_main_conf_t  *cmcf;
+
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
+
+    if (cmcf != NULL
+        && ngx_http_cache_purge_index_peek(cmcf) != NULL
+        /* a failed index cannot take entries; skip the attempt (a hint) */
+        && ngx_http_cache_purge_index_peek(cmcf)->state
+           != NGX_CACHE_PURGE_INDEX_FAILED
+        && r->cache != NULL
+        && r->upstream != NULL
+        && !r->cached
+        && r->upstream->headers_in.status_n != 0
+        && r->cache->file_cache != NULL
+        && r->cache->keys.nelts > 0)
+    {
+        ngx_http_cache_purge_index_record(r, cmcf);
+    }
+
+    return ngx_http_cache_purge_next_header_filter(r);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_filter_init(ngx_conf_t *cf)
+{
+    ngx_http_cache_purge_next_header_filter = ngx_http_top_header_filter;
+    ngx_http_top_header_filter = ngx_http_cache_purge_header_filter;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_index_init_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_http_cache_purge_main_conf_t  *cmcf = shm_zone->data;
+    ngx_http_cache_purge_index_sh_t   *sh;
+
+    cmcf->index_shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+
+    /* a reload keeps the index (data / shm.exists); a start creates it */
+    sh = ngx_http_cache_purge_index_lock(cmcf);
+
+    if (sh != NULL) {
+        /* the insert callback lives in this (reloadable) module */
+        sh->rbtree.insert = ngx_http_cache_purge_index_rbtree_insert;
+    }
+
+    ngx_http_cache_purge_index_unlock(cmcf);
+
+    return (sh != NULL) ? NGX_OK : NGX_ERROR;
 }
 
 
@@ -1683,14 +4497,10 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
         && (cplcf->conf->purge_all || ngx_http_cache_purge_is_partial(r)))
     {
         key = r->cache->keys.elts;
-        if (ngx_http_cache_purge_enqueue(r, cache, &key[0],
-                                         cplcf->conf->purge_all) == NGX_OK)
+        if (ngx_http_cache_purge_try_enqueue(r, cache, &key[0],
+                                             cplcf->conf->purge_all)
+            == NGX_DONE)
         {
-            r->headers_out.status = NGX_HTTP_ACCEPTED;
-            ngx_str_set(&status, "queued");
-            r->main->count++;
-            ngx_http_finalize_request(r,
-                ngx_http_cache_purge_send_response(r, &status));
             return NGX_DONE;
         }
     }
@@ -2072,14 +4882,10 @@ ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r)
         && (cplcf->conf->purge_all || ngx_http_cache_purge_is_partial(r)))
     {
         key = r->cache->keys.elts;
-        if (ngx_http_cache_purge_enqueue(r, cache, &key[0],
-                                         cplcf->conf->purge_all) == NGX_OK)
+        if (ngx_http_cache_purge_try_enqueue(r, cache, &key[0],
+                                             cplcf->conf->purge_all)
+            == NGX_DONE)
         {
-            r->headers_out.status = NGX_HTTP_ACCEPTED;
-            ngx_str_set(&status, "queued");
-            r->main->count++;
-            ngx_http_finalize_request(r,
-                ngx_http_cache_purge_send_response(r, &status));
             return NGX_DONE;
         }
     }
@@ -2301,14 +5107,10 @@ ngx_http_scgi_cache_purge_handler(ngx_http_request_t *r)
         && (cplcf->conf->purge_all || ngx_http_cache_purge_is_partial(r)))
     {
         key = r->cache->keys.elts;
-        if (ngx_http_cache_purge_enqueue(r, cache, &key[0],
-                                         cplcf->conf->purge_all) == NGX_OK)
+        if (ngx_http_cache_purge_try_enqueue(r, cache, &key[0],
+                                             cplcf->conf->purge_all)
+            == NGX_DONE)
         {
-            r->headers_out.status = NGX_HTTP_ACCEPTED;
-            ngx_str_set(&status, "queued");
-            r->main->count++;
-            ngx_http_finalize_request(r,
-                ngx_http_cache_purge_send_response(r, &status));
             return NGX_DONE;
         }
     }
@@ -2554,14 +5356,10 @@ ngx_http_uwsgi_cache_purge_handler(ngx_http_request_t *r)
         && (cplcf->conf->purge_all || ngx_http_cache_purge_is_partial(r)))
     {
         key = r->cache->keys.elts;
-        if (ngx_http_cache_purge_enqueue(r, cache, &key[0],
-                                         cplcf->conf->purge_all) == NGX_OK)
+        if (ngx_http_cache_purge_try_enqueue(r, cache, &key[0],
+                                             cplcf->conf->purge_all)
+            == NGX_DONE)
         {
-            r->headers_out.status = NGX_HTTP_ACCEPTED;
-            ngx_str_set(&status, "queued");
-            r->main->count++;
-            ngx_http_finalize_request(r,
-                ngx_http_cache_purge_send_response(r, &status));
             return NGX_DONE;
         }
     }
@@ -3104,62 +5902,26 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
 void
 ngx_http_cache_purge_all(ngx_http_request_t *r, ngx_http_file_cache_t *cache)
 {
-    ngx_http_cache_purge_walk_ctx_t  ctx;
-    ngx_tree_ctx_t                   tree;
+    ngx_str_t  all = ngx_null_string;
 
-    ngx_memzero(&ctx,  sizeof(ngx_http_cache_purge_walk_ctx_t));
-    ngx_memzero(&tree, sizeof(ngx_tree_ctx_t));
-
-    tree.file_handler      = ngx_http_purge_file_cache_delete_file;
-    tree.pre_tree_handler  = ngx_http_purge_file_cache_noop;
-    tree.post_tree_handler = ngx_http_purge_file_cache_noop;
-    tree.spec_handler      = ngx_http_purge_file_cache_noop;
-    tree.data              = &ctx;
-    tree.log               = ngx_cycle->log;
-
-    ngx_walk_tree(&tree, &cache->path->name);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "ngx_cache_purge: purge_all deleted %ui file(s) "
-                   "from zone \"%V\"", ctx.files_deleted, &cache->path->name);
+    (void) ngx_http_cache_purge_scan_sync(r, cache, &all);
 }
 
 ngx_uint_t
 ngx_http_cache_purge_partial(ngx_http_request_t *r,
     ngx_http_file_cache_t *cache)
 {
-    ngx_http_cache_purge_walk_ctx_t  ctx;
-    ngx_tree_ctx_t                   tree;
-    ngx_str_t                       *key;
-    ngx_uint_t                       len;
+    ngx_str_t  *key, pattern;
 
     key = r->cache->keys.elts;
-    len = key[0].len;
 
-    if (len > 0 && key[0].data[len - 1] == '*') {
-        len--;
+    pattern = key[0];
+
+    if (pattern.len > 0 && pattern.data[pattern.len - 1] == '*') {
+        pattern.len--;
     }
 
-    ngx_memzero(&ctx,  sizeof(ngx_http_cache_purge_walk_ctx_t));
-    ngx_memzero(&tree, sizeof(ngx_tree_ctx_t));
-
-    ctx.key_partial = key[0].data;
-    ctx.key_len     = len;
-
-    tree.file_handler      = ngx_http_purge_file_cache_delete_partial_file;
-    tree.pre_tree_handler  = ngx_http_purge_file_cache_noop;
-    tree.post_tree_handler = ngx_http_purge_file_cache_noop;
-    tree.spec_handler      = ngx_http_purge_file_cache_noop;
-    tree.data              = &ctx;
-    tree.log               = ngx_cycle->log;
-
-    ngx_walk_tree(&tree, &cache->path->name);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "ngx_cache_purge: partial walk deleted %ui file(s) "
-                   "for key prefix \"%V\"", ctx.files_deleted, &key[0]);
-
-    return ctx.files_deleted;
+    return ngx_http_cache_purge_scan_sync(r, cache, &pattern);
 }
 
 ngx_int_t

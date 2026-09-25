@@ -60,9 +60,9 @@ __DATA__
 --- error_log eval
 qr/invalid number/
 
-=== TEST 3: queue overflow — second wildcard purge falls back to 412
-# queue_size=1 so the second enqueue attempt is rejected; the sync
-# fallback finds no cached entry for that key and returns 412.
+=== TEST 3: queue overflow — second wildcard purge is answered 429
+# queue_size=1 so the second enqueue attempt is rejected.  A full queue
+# pushes back with 429 instead of walking the cache in the request worker.
 --- http_config
     cache_purge_background_queue on;
     cache_purge_queue_size  1;
@@ -79,7 +79,7 @@ qr/invalid number/
 --- request eval
 ["PURGE /cache/test1*", "PURGE /cache/test2*"]
 --- error_code eval
-[202, 412]
+[202, 429]
 
 === TEST 4: purge_all is enqueued
 --- http_config eval: $::HttpConfig

@@ -47,15 +47,19 @@ CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_cache_purge_module.c"
 # Older versions require manual population of HTTP_MODULES and
 # NGX_ADDON_SRCS.
 # ------------------------------------------------------------------
+# HTTP_FILTER, not HTTP: the module installs a header filter for
+# cache_purge_index, and in a static build a plain HTTP module's
+# postconfiguration runs before ngx_http_header_filter_module resets the top
+# of the filter chain.
 if [ -n "$ngx_module_link" ]; then
-    ngx_module_type=HTTP
+    ngx_module_type=HTTP_FILTER
     ngx_module_name="$ngx_addon_name"
     ngx_module_srcs="$CACHE_PURGE_SRCS"
     ngx_module_deps=""
     ngx_module_libs=""
     . auto/module
 else
-    HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+    HTTP_FILTER_MODULES="$HTTP_FILTER_MODULES $ngx_addon_name"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $CACHE_PURGE_SRCS"
 fi
 

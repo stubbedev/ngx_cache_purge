@@ -154,7 +154,9 @@ echo "Running memory tests..."\n\
 prove -v t/memory.t; purge_servroot\n\
 \n\
 echo "Running performance tests..."\n\
-prove -v t/performance.t\n\
+prove -v t/performance.t; purge_servroot\n\
+echo "Running index tests..."\n\
+prove -v t/index.t\n\
 \n\
 echo "All tests completed successfully!"\n\
 ' > /usr/local/bin/run_tests.sh && chmod +x /usr/local/bin/run_tests.sh
