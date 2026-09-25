@@ -469,6 +469,9 @@ static void ngx_http_cache_purge_build_end(ngx_http_cache_purge_build_t *b);
 static void ngx_http_cache_purge_build_release(
     ngx_http_cache_purge_main_conf_t *cmcf, ngx_http_cache_purge_build_t *b);
 static void ngx_http_cache_purge_build_tick(ngx_event_t *ev);
+static void ngx_http_cache_purge_refresh_added(
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_http_cache_purge_build_t *b,
+    u_char *key, size_t len, u_char *md5, ngx_log_t *log);
 static ngx_http_file_cache_node_t *ngx_http_cache_purge_lookup_node(
     ngx_http_file_cache_t *cache, u_char *key16);
 static ngx_int_t ngx_http_cache_purge_filter_init(ngx_conf_t *cf);
@@ -3160,19 +3163,19 @@ ngx_http_cache_purge_index_collect(ngx_http_cache_purge_main_conf_t *cmcf,
  * Delete the cache file named by md5.  NGX_OK deleted, NGX_DECLINED not
  * there (expired, or still being stored), NGX_ERROR otherwise.
  */
-static ngx_int_t
-ngx_http_cache_purge_delete_md5(ngx_http_file_cache_t *cache, u_char *md5,
-    ngx_log_t *log)
+/* The file of cache key md5 into name (NGX_MAX_PATH); returns its length */
+static size_t
+ngx_http_cache_purge_md5_path(ngx_http_file_cache_t *cache, u_char *md5,
+    u_char *name)
 {
-    ngx_str_t  path;
-    size_t     len;
-    u_char    *p, name[NGX_MAX_PATH];
+    size_t   len;
+    u_char  *p;
 
     len = cache->path->name.len + 1 + cache->path->len
           + 2 * NGX_HTTP_CACHE_KEY_LEN;
 
     if (len >= NGX_MAX_PATH) {
-        return NGX_ERROR;
+        return 0;
     }
 
     /* the layout of ngx_http_file_cache_name() */
@@ -3182,6 +3185,22 @@ ngx_http_cache_purge_delete_md5(ngx_http_file_cache_t *cache, u_char *md5,
     *p = '\0';
 
     ngx_create_hashed_filename(cache->path, name, len);
+
+    return len;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_delete_md5(ngx_http_file_cache_t *cache, u_char *md5,
+    ngx_log_t *log)
+{
+    ngx_str_t  path;
+    size_t     len;
+    u_char     name[NGX_MAX_PATH];
+
+    len = ngx_http_cache_purge_md5_path(cache, md5, name);
+    if (len == 0) {
+        return NGX_ERROR;
+    }
 
     path.data = name;
     path.len  = len;
@@ -4004,6 +4023,45 @@ ngx_http_cache_purge_build_complete(ngx_http_cache_purge_main_conf_t *cmcf,
 }
 
 /*
+ * A refresh added an entry: a file the index did not know -- or one a purge
+ * deleted (and took the entry of) after the walk read it.  Only the first
+ * counts: with the index locked no purge can delete an indexed file, so
+ * the file still being there now decides.  A file already gone takes its
+ * entry with it.  Locked.
+ */
+static void
+ngx_http_cache_purge_refresh_added(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_http_cache_purge_build_t *b, u_char *key, size_t len, u_char *md5,
+    ngx_log_t *log)
+{
+    ngx_http_cache_purge_index_sh_t    *sh = ngx_http_cache_purge_index_peek(cmcf);
+    ngx_http_cache_purge_index_node_t  *n;
+    ngx_file_info_t                     fi;
+    u_char                              name[NGX_MAX_PATH];
+
+    if (b->cache != NULL
+        && ngx_http_cache_purge_md5_path(b->cache, md5, name) != 0
+        && ngx_file_info(name, &fi) == NGX_FILE_ERROR
+        && ngx_errno == NGX_ENOENT)
+    {
+        n = ngx_http_cache_purge_index_bound(&sh->rbtree, b->id, key, len,
+                                             md5, 0);
+        if (n != NULL
+            && ngx_http_cache_purge_index_cmp(b->id, key, len, md5, n) == 0)
+        {
+            ngx_http_cache_purge_index_remove(cmcf, n);
+        }
+        return;
+    }
+
+    if (sh->refresh_added++ < 20) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "ngx_cache_purge: refresh found a cache file the key "
+                      "index did not know: \"%*s\"", len, key);
+    }
+}
+
+/*
  * One slice of this worker's part of the build.  Files are read in batches
  * outside the lock -- opened first, their header reads announced
  * (POSIX_FADV_WILLNEED) so the kernel issues them together, then read --
@@ -4199,7 +4257,9 @@ ngx_http_cache_purge_build_step(ngx_cycle_t *cycle,
                 rc = ngx_http_cache_purge_index_insert(cmcf, b->id, keys[i],
                                                        lens[i], md5s[i]);
                 if (rc == NGX_OK && sh->refreshing) {
-                    sh->refresh_added++;       /* a file the index had lost */
+                    ngx_http_cache_purge_refresh_added(cmcf, b, keys[i],
+                                                       lens[i], md5s[i],
+                                                       cycle->log);
 
                 } else if (rc == NGX_ERROR) {
                     ngx_http_cache_purge_index_lost(cmcf, cycle->log,
