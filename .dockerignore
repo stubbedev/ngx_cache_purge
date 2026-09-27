@@ -1,0 +1,6 @@
+.git
+.claude
+t/e2e/.data
+t/e2e/results
+t/servroot
+**/__pycache__
