@@ -19,6 +19,7 @@ for changes and [distribution packages](#distribution-packages) for packaged bui
 - [Build from source](#build-from-source)
 - [Directives](#directives)
 - [Partial key purge](#partial-key-purge)
+- [How a wildcard purge runs](#how-a-wildcard-purge-runs)
 - [Sample configurations](#sample-configurations)
 - [Performance tuning](#performance-tuning)
 - [Monitoring and debugging](#monitoring-and-debugging)
@@ -36,14 +37,20 @@ for changes and [distribution packages](#distribution-packages) for packaged bui
 - **Inline purge** — dedicated HTTP method (`PURGE`) with IP access control
 - **Separate purge location** — 3-arg `proxy_cache_purge zone key` syntax for
   regex-captured key purging without a `proxy_pass`
-- **Wildcard / partial purge** — trailing `*` walks the cache directory and
-  removes all matching entries
+- **Wildcard / partial purge** — a trailing `*` purges every key with that
+  prefix
 - **`purge_all`** — removes every entry in the cache zone in one request
-- **Background queue** — async purge processing with configurable batch size
-  and throttling so purge I/O does not block worker event loops
+- **Background queue** — wildcard and `purge_all` purges are answered `202`
+  and carried out by coalesced, time-sliced walks; queued purges survive
+  worker crashes and reloads
+- **Key index** — optional per-zone shared-memory index of every cached key,
+  so a wildcard purge costs what it matches instead of a directory walk
+- **Thread pool offload** — optional: reading keys and unlinking files
+  happens in an nginx thread pool, keeping the event loop free
 - **Vary-aware purge** — after an exact-key purge, removes all filesystem
   variants (gzip, Vary header) sharing the same cache key
 - **Response types** — `html` (default), `json`, `xml`, `text`
+- **No dependencies** — nginx and libc only
 
 ---
 
@@ -56,7 +63,10 @@ for changes and [distribution packages](#distribution-packages) for packaged bui
 | 1.28.x | ✓ tested   |
 | 1.29.x | ✓ tested   |
 
-Older releases back to 1.7.9 compile but are not covered by CI.
+CI runs the Test::Nginx suites against the versions above. The key index,
+thread pool and end-to-end suites have also been run by hand against 1.28.3,
+1.30.4, 1.30.5 and 1.31.6, including under AddressSanitizer. Older releases
+back to 1.7.9 compile but are not covered by CI.
 
 ---
 
@@ -101,6 +111,9 @@ Dynamic module:
 ./configure --add-dynamic-module=/path/to/ngx_cache_purge
 make modules
 ```
+
+`cache_purge_thread_pool` needs nginx built with `--with-threads`. Everything
+else works on a default build.
 
 ---
 
@@ -198,10 +211,14 @@ next one; a reload or graceful stop hands it back too. A walk that cannot read
 some cache directories (out of file descriptors, I/O errors) walks them again,
 in rounds further apart, and queues its purges again if they still fail.
 
-Purges are carried out at least once, never lost: after a crash, a reload
-or an index reset one may run again or late, and then also remove what was
-cached after it was acknowledged. That costs a refill from the upstream; it
-never leaves stale content behind.
+Purges are carried out at least once: after a crash, a reload or an index
+reset one may run again or late, and then also remove what was cached after
+it was acknowledged. That costs a refill from the upstream; it never leaves
+stale content behind. The exceptions are logged: a process dying in the
+middle of a change to the queue itself resets the queue (`alert`, with the
+number of purges lost); a purge that cannot be queued again for lack of
+shared memory is dropped (`crit`); and so is one older than
+`cache_purge_queue_timeout`, if set (`error`).
 
 
 ### `cache_purge_queue_size`
@@ -442,8 +459,8 @@ are stored at different filesystem paths but share one logical key. The byte
 immediately after the key string in each file is verified to be `\n`,
 preventing false matches against keys that share only a common prefix.
 
-Disabled by default because it adds a full cache directory walk per exact-key
-purge. Enable it when `gzip_vary on` or `Vary:` headers cause multiple cache
+Disabled by default because it adds a full, synchronous cache directory walk
+per exact-key purge (with `cache_purge_index` too). Enable it when `gzip_vary on` or `Vary:` headers cause multiple cache
 files to be created for a single logical entry. Wildcard and `purge_all`
 purges do not need this option — the walk they already perform catches every
 variant regardless.
@@ -459,9 +476,37 @@ values or query parameters — append `*` to the key to request a prefix match:
 PURGE /images/header*
 ```
 
-The `*` must be the last character of the URI. Ensure `$uri` appears at the
-**end** of `proxy_cache_key` when using this feature, otherwise the prefix
-match will not align with the stored key.
+Rules:
+
+- `*` is only special as the last character of the key. Anywhere else it is a
+  literal `*`. There are no other glob characters.
+- Matching is a case-insensitive prefix match on the full cache key.
+- Put the variable part (usually `$uri`) at the **end** of `proxy_cache_key`,
+  or the prefix will not line up with the stored keys.
+- A key of just `*` matches everything in the zone, like `purge_all`.
+- A wildcard key longer than 512 bytes is answered `400`.
+
+---
+
+## How a wildcard purge runs
+
+What happens to a wildcard or `purge_all` purge depends on the directives in
+effect:
+
+| Configuration | What happens | Answer |
+|---|---|---|
+| no background queue | the cache directory is walked in the request handler | `200` when done |
+| `cache_purge_background_queue on` | queued; worker 0 walks the cache once for up to `cache_purge_batch_size` queued purges, in slices of `cache_purge_walk_budget` | `202` |
+| `+ cache_purge_index` | range lookup in the zone's index; up to `cache_purge_index_sync_limit` files are deleted before answering, the rest in the background | `200`, or `202` for more |
+| `+ cache_purge_thread_pool` | as above, with key reads and unlinks in the thread pool | as above |
+
+While the index is being built (after a start, or after it was reset), a
+wildcard is applied to what is indexed so far and to the rest as the build
+reaches it, and is answered `202`. If the index fills up, a `crit` line is
+logged and wildcards fall back to queued walks until it has been rebuilt.
+
+Exact-key purges always run synchronously and never walk the cache, unless
+`cache_purge_vary_aware on`.
 
 ---
 
@@ -585,6 +630,40 @@ http {
 }
 ```
 
+### Large cache — key index and thread pool
+
+```nginx
+thread_pool default threads=16;
+
+http {
+    proxy_cache_path /var/cache/images levels=1:2 keys_zone=images:512m
+                     max_size=500g inactive=30d;
+    proxy_cache_path /var/cache/videos levels=1:2 keys_zone=videos:64m
+                     max_size=1t inactive=30d;
+
+    cache_purge_background_queue  on;
+    cache_purge_queue_size        8192;
+    cache_purge_batch_size        8192;
+    cache_purge_index             1g videos=64m;
+    cache_purge_thread_pool       default;
+    cache_purge_index_refresh     1h;
+    cache_purge_legacy_status     off;
+    cache_purge_response_type     json;
+
+    server {
+        location /cdn/ {
+            proxy_pass        http://backend;
+            proxy_cache       images;
+            proxy_cache_key   "$host$uri$is_args$args";
+            proxy_cache_purge PURGE from 10.0.0.0/8;
+        }
+    }
+}
+```
+
+Size the index at ~170–260 bytes per cached file: 1 GB holds roughly 4–6
+million files.
+
 ### Vary-aware purge
 
 ```nginx
@@ -601,40 +680,61 @@ paths are also removed automatically.
 
 ## Performance tuning
 
-The appropriate values depend on storage type, cached file count, and purge
-request rate. The table below gives reasonable starting points.
+Good values depend on storage, how many files are cached, and how many
+wildcard purges arrive.
 
-| Environment | `queue_size` | `batch_size` | `throttle_ms` |
-|---|---|---|---|
-| Small VPS — 1–2 cores, ≤ 2 GB RAM | 512 | 5 | 25ms |
-| Mid-range VDS — 4–8 cores, SSD | 2048 | 20 | 10ms |
-| Dedicated server — 16+ cores, NVMe | 8192 | 50 | 5ms |
-| High purge rate, any hardware | 8192 | 5 | 50ms |
-
-For large caches, `cache_purge_index` plus `cache_purge_thread_pool default;`
-keeps both wildcard purges and index builds off the event loop.
+- **Few wildcard purges, small cache:** the background queue on its own is
+  enough.
+- **Many wildcard purges, or more than ~100k cached files:** add
+  `cache_purge_index`. A wildcard then costs what it matches instead of a
+  full walk, and one that matches nothing is a lock-free lookup.
+- **Large caches, or builds and bulk purges that must not slow requests:** add
+  `cache_purge_thread_pool default;` (needs `--with-threads`).
+- **`cache_purge_batch_size`:** one walk carries out the whole batch for about
+  the cost of one purge, so set it as high as `cache_purge_queue_size`.
+- **`cache_purge_walk_budget` / `cache_purge_throttle_ms`:** how long a slice
+  of inline disk work runs, and how long the event loop gets between slices.
+  On spinning disks or network storage, lower the budget and raise the
+  throttle. With a thread pool they matter much less.
 
 **Queue memory:** `queue_size × ~1.5 KB`. 2048 slots ≈ 3 MB of shared memory.
 
-**Throughput ceiling:** `batch_size ÷ throttle_ms_value × 1000` purges/sec, where
-`throttle_ms_value` is the numeric millisecond count (e.g. `10` for `10ms`). At
-defaults: `10 ÷ 10 × 1000 = 1 000/s`. On spinning disk or network storage,
-keep `batch_size` low and `throttle_ms` high to avoid iowait spikes.
+**Index memory:** ~170–260 bytes per cached file, depending on key length.
+
+**Measured** on 200 GB / 2.5M real cache files with the thread pool: request
+p99 stayed at 7 ms during an index rebuild, 3.6 ms during a 307k-file bulk
+purge and 7.6 ms during a 2.1M-file `purge_all`. A rebuild after a crash,
+under load, takes ~10 s. Background bulk deletion runs at ~28–30k files/s.
+Wildcard purges that match nothing reach ~540k requests/s on 8 cores, about
+nginx's own ceiling for the same request.
 
 ---
 
 ## Monitoring and debugging
 
-Successful background purges return `202 Accepted`. The response body uses the
-format set by `cache_purge_response_type`.
+Purge answers:
 
-Relevant log messages:
+| Status | Meaning |
+|---|---|
+| `200` | purged |
+| `202` | accepted; the rest is carried out in the background |
+| `400` | wildcard key too long (512 bytes) |
+| `403` | client not in the allowed list |
+| `404` / `412` | nothing matched (see `cache_purge_legacy_status`) |
+| `429` | background queue full |
 
-| Level   | Condition                          |
-|---------|------------------------------------|
-| `warn`  | Queue full; item timed out in queue |
-| `error` | Cache zone not found               |
-| `crit`  | File deletion failed               |
+The response body uses the format set by `cache_purge_response_type`.
+
+Relevant log messages (all start with `ngx_cache_purge:`):
+
+| Level | Condition |
+|---|---|
+| `info` | a background walk finished: files checked, deleted, time taken |
+| `notice` | index build or refresh started |
+| `warn` | queue full; refresh found files the index did not know |
+| `error` | cache zone not found; queued purge timed out |
+| `crit` | file deletion failed; `opendir()` failed; index full (wildcards fall back to walks); index build failed; out of shared memory |
+| `alert` | a process died while updating the queue or an index, which is reset |
 
 ```bash
 tail -f /var/log/nginx/error.log | grep "cache purge"
@@ -645,16 +745,29 @@ tail -f /var/log/nginx/error.log | grep "cache purge"
 ## Troubleshooting
 
 **Purge requests block worker processes**
-Enable `cache_purge_background_queue on`.
+Enable `cache_purge_background_queue on`. For large caches add
+`cache_purge_index` and `cache_purge_thread_pool`.
 
-**Queue full warnings in the log**
-Increase `cache_purge_queue_size`, or reduce the purge request rate.
+**Queue full warnings, or `429` on wildcard purges**
+Increase `cache_purge_queue_size` and `cache_purge_batch_size`, or add
+`cache_purge_index`.
+
+**`crit` "cache_purge_index zone is full"**
+Increase `cache_purge_index` (~170–260 bytes per cached file). Until the
+index has been rebuilt, wildcards are carried out by walks.
+
+**`warn` "refresh found a cache file the key index ... did not know"**
+Files were copied into the cache from outside, or a process was killed at
+the wrong moment; the refresh has already added them. If it keeps happening
+without either, please open an issue.
 
 **High iowait during purges**
-Decrease `cache_purge_batch_size` and increase `cache_purge_throttle_ms`.
+Lower `cache_purge_walk_budget` and raise `cache_purge_throttle_ms`, or use
+`cache_purge_thread_pool`.
 
 **Queue drains too slowly**
-Increase `cache_purge_batch_size` and decrease `cache_purge_throttle_ms`.
+Raise `cache_purge_batch_size` (up to `cache_purge_queue_size`) and
+`cache_purge_walk_budget`, or add `cache_purge_index`.
 
 **`412` responses where `404` is expected**
 Set `cache_purge_legacy_status off`.
@@ -680,10 +793,26 @@ prove t/background_queue.t
 prove t/config.t
 prove t/memory.t
 prove t/performance.t
+prove t/index.t
+prove t/index_threads.t   # needs nginx built with --with-threads
 ```
 
 See [`t/TESTING.md`](t/TESTING.md) for Docker-based testing and the full
 testing guide.
+
+### End-to-end and torture suites
+
+[`t/e2e`](t/e2e/README.md) runs a real nginx with the module in front of a
+second nginx as origin, over a cache seeded directly onto disk in nginx's
+own file format. A verifier checks that no purge leaves stale content and
+that a wildcard removes every matching file on disk.
+
+```bash
+t/e2e/run.sh quick          # ~80k files, a few minutes
+t/e2e/run.sh chaos          # kill -9, reloads, gdb inside an index change, disk tampering
+t/e2e/run.sh scale          # 2.5M files, 200 GB (sparse by default)
+t/e2e/torture.sh            # targeted fault injection, with and without a thread pool
+```
 
 ---
 
@@ -756,9 +885,9 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
 ## Technical and historical notes
 
 - The original default branch ends on [23 December 2014](https://github.com/FRiCKLE/ngx_cache_purge/commit/331fe43e8d9a3d1fa5e0c9fec7d3201d431a9177). As of this check, twelve full years have not elapsed.
-- **Avoid “fully non-blocking.”** The queue callback still calls `ngx_walk_tree` synchronously. Deferring a purge does not remove its filesystem cost. Exact-key purges remain synchronous; enabling `Vary` handling adds a directory scan.
+- **Avoid “fully non-blocking.”** Without `cache_purge_thread_pool`, background walks and index builds do their disk I/O on the event loop, in slices of `cache_purge_walk_budget`. Exact-key purges are always synchronous, and `cache_purge_vary_aware` adds a synchronous directory walk to each one.
 - **Do not promise unchanged behavior for every upgrade.** The 2.5 status-code change alone makes that inaccurate. Release 3.0.0 also flags internal breaking changes.
-- **Describe CI configuration accurately.** The checked workflow targets NGINX 1.20.2, 1.26.3, 1.28.2, and 1.29.6. This research did not run the test suite or establish compatibility with every newer NGINX version.
+- **Describe CI configuration accurately.** The workflow targets NGINX 1.20.2, 1.26.3, 1.28.2 and 1.29.6. Runs on 1.28.3, 1.30.x and 1.31.6 were done by hand, not in CI.
 - **Keep package links factual.** Downstream packaging demonstrates use of the source, not endorsement, an audit, or a support commitment from that distribution to this repository.
 
 ---
