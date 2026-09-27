@@ -53,7 +53,7 @@ test: build
 test-all: build
 	@echo "$(GREEN)Running full test suite ($(IMAGE))...$(NC)"
 	docker run --rm -v "$(shell pwd)/..:/src" $(IMAGE) \
-	    prove -v t/basic.t t/background_queue.t t/config.t t/memory.t t/performance.t
+	    prove -v t/basic.t t/background_queue.t t/config.t t/memory.t t/performance.t t/index.t t/index_threads.t
 	@echo "$(GREEN)Done$(NC)"
 
 test-compat:

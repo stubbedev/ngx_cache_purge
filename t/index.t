@@ -93,3 +93,41 @@ __DATA__
 --- must_die
 --- error_log eval
 qr/cache_purge_index requires cache_purge_background_queue on/
+
+
+=== TEST 5: cache_purge_index names an unknown cache zone
+--- http_config
+    proxy_cache_path /tmp/ncp_t9 keys_zone=known:1m;
+    cache_purge_background_queue on;
+    cache_purge_index 4m nosuch=1m;
+--- config
+    location /health {
+        return 200 "ok";
+    }
+--- must_die
+--- error_log eval
+qr/cache_purge_index: unknown cache zone "nosuch"/
+
+=== TEST 6: cache_purge_thread_pool tasks= out of range
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_thread_pool default tasks=0;
+--- config
+    location /health {
+        return 200 "ok";
+    }
+--- must_die
+--- error_log eval
+qr/"tasks=0" must be between 1 and 64/
+
+=== TEST 7: cache_purge_thread_pool off
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_thread_pool off;
+--- config
+    location /health {
+        return 200 "ok";
+    }
+--- request
+GET /health
+--- error_code: 200

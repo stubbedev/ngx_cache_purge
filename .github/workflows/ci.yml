@@ -78,6 +78,18 @@ jobs:
           ngx-cache-purge-test:${{ matrix.nginx_version }}-${{ matrix.ubuntu_version }} \
           prove -v t/performance.t
 
+    - name: Run key index tests
+      run: |
+        docker run --rm -v $PWD:/src \
+          ngx-cache-purge-test:${{ matrix.nginx_version }}-${{ matrix.ubuntu_version }} \
+          prove -v t/index.t
+
+    - name: Run thread pool index tests
+      run: |
+        docker run --rm -v $PWD:/src \
+          ngx-cache-purge-test:${{ matrix.nginx_version }}-${{ matrix.ubuntu_version }} \
+          prove -v t/index_threads.t
+
     - name: Generate test reports
       if: always()
       run: |

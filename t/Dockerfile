@@ -157,6 +157,8 @@ echo "Running performance tests..."\n\
 prove -v t/performance.t; purge_servroot\n\
 echo "Running index tests..."\n\
 prove -v t/index.t\n\
+echo "Running thread pool index tests..."\n\
+prove -v t/index_threads.t\n\
 \n\
 echo "All tests completed successfully!"\n\
 ' > /usr/local/bin/run_tests.sh && chmod +x /usr/local/bin/run_tests.sh

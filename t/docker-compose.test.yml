@@ -18,7 +18,7 @@ services:
   # Main test runner — default prove target
   nginx-test:
     <<: *test-base
-    command: prove -v t/basic.t t/background_queue.t t/config.t t/memory.t t/performance.t
+    command: prove -v t/basic.t t/background_queue.t t/config.t t/memory.t t/performance.t t/index.t t/index_threads.t
 
   # Individual suites (useful for `docker-compose run --rm <service>`)
   test-basic:

@@ -192,6 +192,17 @@ When enabled, wildcard and `purge_all` purge requests are enqueued and return
 batches. Has no effect on exact-key purges, which are always synchronous. When
 disabled, all purges are processed synchronously in the request handler.
 
+A queued purge stays in shared memory until it has been carried out: if the
+worker running it dies (crash, `kill -9`), it is queued again and run by the
+next one; a reload or graceful stop hands it back too. A walk that cannot read
+some cache directories (out of file descriptors, I/O errors) walks them again,
+in rounds further apart, and queues its purges again if they still fail.
+
+Purges are carried out at least once, never lost: after a crash, a reload
+or an index reset one may run again or late, and then also remove what was
+cached after it was acknowledged. That costs a refill from the upstream; it
+never leaves stale content behind.
+
 
 ### `cache_purge_queue_size`
 
@@ -234,8 +245,10 @@ Context: http
 ```
 
 How long a background walk (and a key index build) runs before it yields to
-the event loop; it resumes on the next tick, `cache_purge_throttle_ms` later.
-`0` walks a whole directory in one tick.
+the event loop. A walk resumes on the next tick, `cache_purge_throttle_ms`
+later; a build too, or with `cache_purge_thread_pool` as soon as the pending
+events have been handled (its disk work happens in the pool). `0` walks a
+whole directory in one tick.
 
 
 ### `cache_purge_queue_timeout`
@@ -253,16 +266,24 @@ dropped purge leaves stale content.
 ### `cache_purge_index`
 
 ```
-Syntax:  cache_purge_index <size>
+Syntax:  cache_purge_index <size> [<zone>=<size> ...]
 Default: 0 (off)
 Context: http
 Requires: cache_purge_background_queue on
 ```
 
-Keeps every key stored in any cache in a shared-memory index of this size, so
-that a wildcard or `purge_all` purge is a range lookup plus exact deletes
-instead of a directory walk: its cost follows the files it matches, not the
-size of the cache.
+Keeps every key stored in any cache in shared-memory indexes, so that a
+wildcard or `purge_all` purge is a range lookup plus exact deletes instead of
+a directory walk: its cost follows the files it matches, not the size of the
+cache.
+
+Every cache zone gets an index of its own, in a shared memory zone of its
+own with its own lock: fills and purges of one cache never wait for
+another's. `<size>` is the total; `<zone>=<size>` sets the share of a
+`keys_zone`, and the rest is divided among the other zones in proportion to
+their `keys_zone` sizes (which bound how many files each can hold). For
+example `cache_purge_index 1g videos=64m;` gives `videos` 64 MB and the other
+zones the remaining 960 MB between them.
 
 * Entries are recorded when an upstream response is about to be stored,
   subrequests (slices, background updates) and both Vary file names
@@ -271,10 +292,17 @@ size of the cache.
 * After a (re)start the index is built from the files on disk, in parallel
   by all workers (a reload keeps it). Wildcards during the build are applied
   to what is indexed and to the rest as the walk reaches it, and answered
-  `202`.
+  `202`; each is also queued to run again once the build is over, so that
+  it is not lost if the index is reset during the build.
+* A build that cannot read a cache directory (out of file descriptors, I/O
+  errors) fails rather than leave files out; it is retried after 10 s, with
+  fewer files open at a time.
 * Size it at ~170-260 bytes per cached file (the key length decides). If it
   runs full, a `crit` line is logged and wildcards fall back to the queued
   walks until the index has been reconciled and rebuilt.
+* Lookups that find what they look for -- a wildcard that matches nothing, a
+  fill or revalidation of a key already indexed -- do not take the index
+  lock: they read optimistically and check a sequence counter afterwards.
 * The queue and the index are locked with their slab pool's mutex, which the
   master releases when a worker dies; a worker that dies in the middle of a
   change resets the zone (the index is rebuilt from disk) rather than leave
@@ -308,7 +336,9 @@ Context: http
 
 How often entries of files the cache manager expired or evicted are dropped
 (a walk of the index in memory, not of the disk; it waits for the cache
-loader after a start). Also how often a failed index is retried.
+loader after a start). A pass is spread over half of this interval, a few
+entries at a time, rather than run in one burst. Also how often a failed
+index is retried.
 
 
 ### `cache_purge_index_refresh`
@@ -324,6 +354,37 @@ not know -- restored or copied in from outside, or lost by a process killed
 at the wrong moment. The walk only adds entries, so it is always safe; it
 logs a `warn` with the count when it had to add any.
 
+A refresh only reads the directories that changed since the previous walk
+began: their ctime moves with every file created, renamed or deleted in
+them (and with `utimes()`, so restoring a directory with old mtimes does not
+hide it). Every sixth refresh reads all of them regardless.
+
+
+### `cache_purge_thread_pool`
+
+```
+Syntax:  cache_purge_thread_pool off | <name> [tasks=<n>]
+Default: off
+Context: http
+Requires: nginx built with --with-threads
+```
+
+Carries out the disk work of purges and index walks -- reading the keys of
+cache files, unlinking them -- in the nginx thread pool `<name>` (see
+[`thread_pool`](https://nginx.org/en/docs/ngx_core_module.html#thread_pool);
+`default` exists without being declared), so that the event loop keeps
+serving requests while it happens. Shared memory is never touched from a
+thread: the bookkeeping stays on the event loop, in short slices.
+
+* A wildcard answered from the index waits for its unlinks in the pool; the
+  worker serves other requests meanwhile.
+* An index build keeps `<n>` directory reads in flight per worker (default
+  4), a queued walk `<n>` per drainer.
+* At most `2 × <n>` operations per worker are in the pool at once; beyond
+  that, and when the pool's queue is full, the work is done inline.
+
+Without it the same work runs inline in slices of `cache_purge_walk_budget`,
+with the event loop getting its turn between slices.
 
 ### `cache_purge_throttle_ms`
 
@@ -549,6 +610,9 @@ request rate. The table below gives reasonable starting points.
 | Mid-range VDS — 4–8 cores, SSD | 2048 | 20 | 10ms |
 | Dedicated server — 16+ cores, NVMe | 8192 | 50 | 5ms |
 | High purge rate, any hardware | 8192 | 5 | 50ms |
+
+For large caches, `cache_purge_index` plus `cache_purge_thread_pool default;`
+keeps both wildcard purges and index builds off the event loop.
 
 **Queue memory:** `queue_size × ~1.5 KB`. 2048 slots ≈ 3 MB of shared memory.
 
