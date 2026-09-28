@@ -128,3 +128,26 @@ PURGE /cache/test
 [202, 202]
 --- response_body eval
 [qr{Key: /cache/same}, qr{Key: /cache/same}]
+
+=== TEST 7: purge_all requests with different URIs are one queued purge
+# purge_all ignores its key; each URI used to take a queue slot of its own.
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache levels=1:2
+                     keys_zone=pa_zone:10m;
+    cache_purge_background_queue on;
+    cache_purge_queue_size       2;
+    cache_purge_batch_size       1;
+    cache_purge_throttle_ms      10s;
+--- config
+    location /cache {
+        proxy_pass http://127.0.0.1:1;
+        proxy_cache pa_zone;
+        proxy_cache_key "$uri";
+        proxy_cache_purge PURGE purge_all from 127.0.0.1;
+    }
+--- request eval
+["PURGE /cache/u1", "PURGE /cache/u2", "PURGE /cache/u3", "PURGE /cache/u4", "PURGE /cache/u5"]
+--- error_code eval
+[202, 202, 202, 202, 202]
+--- no_error_log
+queue full

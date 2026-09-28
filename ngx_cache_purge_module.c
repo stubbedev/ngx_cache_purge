@@ -756,7 +756,7 @@ static ngx_uint_t ngx_http_cache_purge_hash_key(ngx_str_t *cache_path,
     ngx_str_t *key);
 static ngx_http_cache_purge_queue_item_t *ngx_http_cache_purge_find_duplicate(
     ngx_http_cache_purge_queue_t *queue, ngx_uint_t mode, ngx_uint_t hash,
-    ngx_str_t *cache_path, ngx_str_t *key);
+    ngx_str_t *cache_path, ngx_str_t *key, ngx_flag_t purge_all);
 
 # if (NGX_HTTP_FASTCGI)
 char      *ngx_http_fastcgi_cache_purge_conf(ngx_conf_t *cf,
@@ -1879,6 +1879,17 @@ ngx_http_cache_purge_enqueue_raw(ngx_http_cache_purge_main_conf_t *cmcf,
     ngx_uint_t                          hash, size;
     u_char                             *p;
 
+    static ngx_str_t                    all = ngx_null_string;
+
+    /*
+     * purge_all matches everything whatever its key (the request's cache
+     * key): kept without one, it is one purge per cache path and mode, not
+     * one per URI -- and not the duplicate of a wildcard of the same key.
+     */
+    if (purge_all) {
+        key = &all;
+    }
+
     hash = ngx_http_cache_purge_hash_key(cache_path, key);
 
     queue = ngx_http_cache_purge_queue_lock(cmcf);
@@ -1897,7 +1908,7 @@ ngx_http_cache_purge_enqueue_raw(ngx_http_cache_purge_main_conf_t *cmcf,
     }
 
     if (ngx_http_cache_purge_find_duplicate(queue, mode, hash, cache_path,
-                                            key)
+                                            key, purge_all)
         != NULL)
     {
         ngx_http_cache_purge_queue_unlock(cmcf);
@@ -2770,7 +2781,8 @@ ngx_http_cache_purge_hash_key(ngx_str_t *cache_path, ngx_str_t *key)
 
 static ngx_http_cache_purge_queue_item_t *
 ngx_http_cache_purge_find_duplicate(ngx_http_cache_purge_queue_t *queue,
-    ngx_uint_t mode, ngx_uint_t hash, ngx_str_t *cache_path, ngx_str_t *key)
+    ngx_uint_t mode, ngx_uint_t hash, ngx_str_t *cache_path, ngx_str_t *key,
+    ngx_flag_t purge_all)
 {
     ngx_http_cache_purge_queue_item_t *item;
 
@@ -2784,7 +2796,9 @@ ngx_http_cache_purge_find_duplicate(ngx_http_cache_purge_queue_t *queue,
          * multiplier hash will collide for distinct keys in large caches,
          * causing legitimate purge requests to be silently discarded.
          */
-        if (item->hash != hash || item->mode != mode) {
+        if (item->hash != hash || item->mode != mode
+            || item->purge_all != purge_all)
+        {
             continue;
         }
 
