@@ -619,3 +619,27 @@ GET /static/index.html
 static t25
 --- no_error_log
 [alert]
+
+=== TEST 26: exact purge with aio threads
+# ngx_http_file_cache_open answers NGX_AGAIN while the thread reads the
+# header; a build with threads but without file AIO used to answer 500
+# and leave the request blocked.
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        aio               threads;
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location /origin {
+        return 200 "t26";
+    }
+--- request eval
+["GET /cache/t26", "PURGE /cache/t26", "PURGE /cache/t26"]
+--- error_code eval
+[200, 200, 412]
+--- no_error_log
+[alert]

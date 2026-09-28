@@ -9262,7 +9262,7 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
     ngx_int_t                         rc;
     ngx_int_t                         not_found_code;
 
-# if (NGX_HAVE_FILE_AIO)
+# if (NGX_HAVE_FILE_AIO || NGX_THREADS)
     if (r->aio) {
         return;
     }
@@ -9303,7 +9303,7 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
         ngx_http_finalize_request(r, not_found_code);
         return;
 
-# if (NGX_HAVE_FILE_AIO)
+# if (NGX_HAVE_FILE_AIO || NGX_THREADS)
     case NGX_AGAIN:
         r->write_event_handler = ngx_http_cache_purge_handler;
         return;
@@ -9335,7 +9335,7 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
     case NGX_DECLINED:
         return NGX_DECLINED;
 
-# if (NGX_HAVE_FILE_AIO)
+# if (NGX_HAVE_FILE_AIO || NGX_THREADS)
     case NGX_AGAIN:
         return NGX_AGAIN;
 # endif
