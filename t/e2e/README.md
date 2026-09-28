@@ -152,3 +152,24 @@ MODE=threads t/e2e/torture.sh            # one mode
 E2E_SANITIZE=asan t/e2e/torture.sh       # AddressSanitizer build
 DUR=120 t/e2e/torture.sh --seq
 ```
+
+## Benchmarks
+
+`t/e2e/bench/bench.py` measures the module's hot paths in the e2e image, on
+a cache seeded with `cachegen`: index build time, HIT and fill throughput,
+exact purges (misses, and ones that each find their file; inline and
+separate syntax), indexed wildcard latency, a synchronous full walk, and a
+queued purge_all. Each measure seeds its own cache and reports worker CPU
+per request next to the rate: the rate of a one-second wrk run is
+bimodal on a busy machine, the CPU is steadier. `compare.py DIR` prints the
+medians of `<mode>-<build>-<rep>.json` runs side by side.
+
+```bash
+docker run --rm --ulimit nofile=200000:200000 -v $PWD/t/e2e/bench:/b:ro \
+    --entrypoint python3 ngx-cache-purge-e2e:1.30.5 /b/bench.py [--threads] [--only exact_hit,walk]
+```
+
+For an A/B, build the image of the other commit from a worktree
+(`docker build -f t/e2e/Dockerfile -t ngx-cache-purge-e2e:base <worktree>`)
+and alternate the two builds in each repetition.
+
