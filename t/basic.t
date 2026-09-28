@@ -672,6 +672,7 @@ PURGE /cache/t27
         proxy_cache_key   "$uri";
         proxy_cache_valid 200 1h;
         proxy_buffer_size 8k;
+        add_header X-Cache $upstream_cache_status;
     }
     location /origin {
         add_header X-Big1 "' . ('b' x 3000) . '";
@@ -679,9 +680,13 @@ PURGE /cache/t27
         return 200 "big";
     }
 '
---- request
-GET /cache/t28
---- error_code: 200
+--- request eval
+# the HIT: the entry is on disk before this nginx stops
+["GET /cache/t28", "GET /cache/t28"]
+--- response_headers_like eval
+["X-Cache: MISS", "X-Cache: HIT"]
+--- error_code eval
+[200, 200]
 
 === TEST 29: exact purge of a long-header entry the new nginx has not seen
 # A node made from the file (no body_start) was read with a page-sized
@@ -709,7 +714,7 @@ too long header
 # The merge took the first enabled protocol, fastcgi, even where the
 # location set proxy_cache_purge itself: no fastcgi cache there, 404.  A
 # separate-syntax location was wrapped by the fastcgi access handler too.
---- http_config eval: $::HttpConfig . "    fastcgi_cache_path $ENV{TEST_NGINX_SERVROOT}/fcgi_cache keys_zone=fcgi_zone:1m;\n"
+--- http_config eval: $::HttpConfig . "    fastcgi_cache_path " . Cwd::cwd() . "/fcgi_cache keys_zone=fcgi_zone:1m;\n"
 --- config
     fastcgi_cache_purge PURGE from 127.0.0.1;
     location /cache {
@@ -729,3 +734,101 @@ too long header
 ["GET /cache/t30", "PURGE /cache/t30", "GET /cache/t30b", "PURGE /sep/t30b"]
 --- error_code eval
 [200, 200, 200, 200]
+
+=== TEST 31: PURGE is still intercepted in a static location that inherits it
+# The decline is for other methods only: a PURGE there is still a purge
+# (nothing cached: 412), not the file.
+--- http_config eval: $::HttpConfig
+--- config
+    proxy_cache_purge PURGE from 127.0.0.1;
+    location /static {
+        proxy_cache cache_zone;
+        proxy_cache_key $uri;
+        alias html;
+    }
+--- user_files
+>>> index.html
+static t31
+--- request
+PURGE /static/index.html
+--- error_code: 412
+--- response_body_unlike: static t31
+
+=== TEST 32: proxy_cache $variable naming a zone: the purge works
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       $arg_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location /origin {
+        return 200 "ok";
+    }
+--- request eval
+["GET /cache/t32?zone=cache_zone", "PURGE /cache/t32?zone=cache_zone", "PURGE /cache/t32?zone=cache_zone"]
+--- error_code eval
+[200, 200, 412]
+
+=== TEST 33: proxy_cache $variable naming no zone answers 404
+# Used to be NGX_ERROR: the connection was closed without an answer.
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       $arg_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location /origin {
+        return 200 "ok";
+    }
+--- request
+PURGE /cache/t33?zone=nosuch
+--- error_code: 404
+--- error_log
+cache zone "nosuch" not found
+
+=== TEST 34: a location's own fastcgi purge wins over an inherited proxy purge
+# The entry is in the proxy zone: the proxy purge would find it (200), the
+# location's own fastcgi purge looks in the fastcgi zone (412).
+--- http_config eval: $::HttpConfig . "    fastcgi_cache_path " . Cwd::cwd() . "/fcgi_cache2 keys_zone=fcgi2_zone:1m;\n"
+--- config
+    proxy_cache_purge PURGE from 127.0.0.1;
+    location /warm {
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "/f/t34";
+        proxy_cache_valid 200 1m;
+    }
+    location /f {
+        fastcgi_pass        127.0.0.1:1;
+        fastcgi_cache       fcgi2_zone;
+        fastcgi_cache_key   $uri;
+        fastcgi_cache_purge PURGE from 127.0.0.1;
+        proxy_cache         cache_zone;
+        proxy_cache_key     $uri;
+    }
+    location /origin {
+        return 200 "ok";
+    }
+--- request eval
+["GET /warm", "PURGE /f/t34"]
+--- error_code eval
+[200, 412]
+
+=== TEST 35: synchronous purge_all of a cache never filled answers 200
+# No cache directory yet is an empty cache, not a read error.
+--- http_config eval
+"    proxy_cache_path " . Cwd::cwd() . "/never_filled_" . $$ . " keys_zone=nf_zone:1m;\n"
+--- config
+    location /cache {
+        proxy_cache       nf_zone;
+        proxy_cache_key   $uri;
+        proxy_cache_purge PURGE purge_all from 127.0.0.1;
+    }
+--- request
+PURGE /cache/x
+--- error_code: 200

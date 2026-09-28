@@ -241,3 +241,96 @@ qr/cache_purge_index_reconcile must be greater than 0/
 --- must_die
 --- error_log eval
 qr/cache_purge_index_sync_limit must not be greater than 1048576/
+
+=== TEST 14: "purge_all from" with an address list is accepted and purges
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=pfa_zone:1m;
+--- config
+    location /cache {
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/origin;
+        proxy_cache pfa_zone;
+        proxy_cache_key $uri;
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE purge_all from 127.0.0.1 ::1;
+    }
+    location /origin { return 200 "ok"; }
+--- request eval
+["GET /cache/a", "PURGE /cache/anything"]
+--- error_code eval
+[200, 200]
+
+=== TEST 15: "purge_all from all" is accepted and purges
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=pfb_zone:1m;
+--- config
+    location /cache {
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/origin;
+        proxy_cache pfb_zone;
+        proxy_cache_key $uri;
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE purge_all from all;
+    }
+    location /origin { return 200 "ok"; }
+--- request eval
+["GET /cache/a", "PURGE /cache/anything"]
+--- error_code eval
+[200, 200]
+
+=== TEST 16: an ordinary key is echoed unchanged (html)
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=okh_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    location ~ ^/purge(/.*) { proxy_cache_purge okh_zone "$1"; }
+--- request
+GET /purge/a-b_c.d/e~f*
+--- error_code: 202
+--- response_body_like: <p>Key: /a-b_c\.d/e~f\*</p>
+
+=== TEST 17: an ordinary key is echoed unchanged (json)
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=okj_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    cache_purge_response_type json;
+    location ~ ^/purge(/.*) { proxy_cache_purge okj_zone "$1"; }
+--- request
+GET /purge/a-b_c.d/%C3%A6%C3%B8*
+--- error_code: 202
+--- response_body_like: ^\{"Key": "/a-b_c\.d/\xc3\xa6\xc3\xb8\*", "Status": "[^"]+"\}$
+
+=== TEST 18: an ordinary key is echoed unchanged (xml)
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=okx_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    cache_purge_response_type xml;
+    location ~ ^/purge(/.*) { proxy_cache_purge okx_zone "$1"; }
+--- request
+GET /purge/a-b_c.d*
+--- error_code: 202
+--- response_body_like: <Key>/a-b_c\.d\*</Key>
+
+=== TEST 19: the text response keeps the key raw
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=okt_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    cache_purge_response_type text;
+    location ~ ^/purge(/.*) { proxy_cache_purge okt_zone "$1"; }
+--- request
+GET /purge/%3Cb%3E%22q%22*
+--- error_code: 202
+--- response_body_like: ^Key: /<b>"q"\*\nStatus:
+
+=== TEST 20: smallest throttle and reconcile, largest sync limit are accepted
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_throttle_ms 1ms;
+    cache_purge_index_reconcile 1ms;
+    cache_purge_index_sync_limit 1048576;
+--- config
+    location /health { return 200 "ok"; }
+--- request
+GET /health
+--- error_code: 200

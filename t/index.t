@@ -149,9 +149,9 @@ GET /health
         return 200 "ok";
     }
 --- request eval
-["GET /cache/e", "GET /cache/e", "PURGE /cache/e", "GET /cache/e"]
+["GET /cache/e", "GET /cache/e?v=x", "GET /cache/e", "GET /cache/e?v=x", "PURGE /cache/e", "GET /cache/e", "GET /cache/e?v=x"]
 --- response_headers_like eval
-["X-Cache: MISS", "X-Cache: HIT", "", "X-Cache: MISS"]
+["X-Cache: MISS", "X-Cache: MISS", "X-Cache: HIT", "X-Cache: HIT", "", "X-Cache: MISS", "X-Cache: MISS"]
 --- error_code eval
-[200, 200, 200, 200]
+[200, 200, 200, 200, 200, 200, 200]
 --- wait: 0.5
