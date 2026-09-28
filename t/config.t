@@ -210,3 +210,34 @@ GET /purge/a%22b%5Cc%01*
 GET /purge/x%5D%5D%3E%3Cy%3E*
 --- error_code: 202
 --- response_body_like: <Key>/x\]\]&gt;&lt;y&gt;\*</Key>
+
+=== TEST 11: cache_purge_throttle_ms 0 causes config error
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_throttle_ms 0;
+--- config
+    location /health { return 200 "ok"; }
+--- must_die
+--- error_log eval
+qr/cache_purge_throttle_ms must be greater than 0/
+
+=== TEST 12: cache_purge_index_reconcile 0 causes config error
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_index_reconcile 0;
+--- config
+    location /health { return 200 "ok"; }
+--- must_die
+--- error_log eval
+qr/cache_purge_index_reconcile must be greater than 0/
+
+=== TEST 13: an oversized cache_purge_index_sync_limit causes config error
+# It sizes an allocation per pass: 2^64/40 + 1 wrapped it to a few bytes.
+--- http_config
+    cache_purge_background_queue on;
+    cache_purge_index_sync_limit 461168601842738791;
+--- config
+    location /health { return 200 "ok"; }
+--- must_die
+--- error_log eval
+qr/cache_purge_index_sync_limit must not be greater than 1048576/

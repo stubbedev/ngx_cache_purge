@@ -344,7 +344,7 @@ Context: http
 ```
 
 Matching files an indexed wildcard deletes before answering; more are deleted
-in the background and the answer is `202`.
+in the background and the answer is `202`. 1 to 1048576.
 
 
 ### `cache_purge_index_reconcile`
@@ -359,7 +359,7 @@ How often entries of files the cache manager expired or evicted are dropped
 (a walk of the index in memory, not of the disk; it waits for the cache
 loader after a start). A pass is spread over half of this interval, a few
 entries at a time, rather than run in one burst. Also how often a failed
-index is retried.
+index is retried. Must be greater than 0.
 
 
 ### `cache_purge_index_refresh`
@@ -416,8 +416,8 @@ Context: http
 ```
 
 Interval between background processing ticks. Accepts any nginx time value:
-`10ms`, `500ms`, `1s`, `2s 500ms`. Only meaningful when
-`cache_purge_background_queue on`.
+`10ms`, `500ms`, `1s`, `2s 500ms`; must be greater than 0. Only meaningful
+when `cache_purge_background_queue on`.
 
 Increase on constrained or spinning-disk storage; decrease on NVMe.
 

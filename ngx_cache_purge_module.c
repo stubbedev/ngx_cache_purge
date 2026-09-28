@@ -104,6 +104,7 @@
 #define NGX_CACHE_PURGE_UNIT_NONE            ((ngx_uint_t) -1)
 #define NGX_CACHE_PURGE_INDEX_SLICE          1024   /* reconcile: per lock */
 #define NGX_CACHE_PURGE_INDEX_SYNC_LIMIT     1024
+#define NGX_CACHE_PURGE_INDEX_SYNC_LIMIT_MAX 1048576
 #define NGX_CACHE_PURGE_INDEX_TAKE           64     /* entries per lock */
 #define NGX_CACHE_PURGE_INDEX_RECONCILE      600000 /* ms */
 /* every this many refreshes one reads every directory, changed or not */
@@ -1118,6 +1119,30 @@ ngx_http_cache_purge_init_main_conf(ngx_conf_t *cf, void *conf)
     if (cmcf->index_sync_limit == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "cache_purge_index_sync_limit must be greater "
+                           "than 0");
+        return NGX_CONF_ERROR;
+    }
+
+    /* it sizes a per-pass array of hits: a huge one overflows the size */
+    if (cmcf->index_sync_limit > NGX_CACHE_PURGE_INDEX_SYNC_LIMIT_MAX) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_purge_index_sync_limit must not be "
+                           "greater than %d",
+                           NGX_CACHE_PURGE_INDEX_SYNC_LIMIT_MAX);
+        return NGX_CONF_ERROR;
+    }
+
+    /* 0 would spin the drainer, the build tick and reconcile on every
+     * event loop iteration */
+    if (cmcf->throttle_ms == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_purge_throttle_ms must be greater than 0");
+        return NGX_CONF_ERROR;
+    }
+
+    if (cmcf->index_reconcile == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_purge_index_reconcile must be greater "
                            "than 0");
         return NGX_CONF_ERROR;
     }
