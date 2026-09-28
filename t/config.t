@@ -174,3 +174,39 @@ Content-Type: text/xml
 --- must_die
 --- error_log eval
 qr/"from" must be followed by "all" or addresses/
+
+=== TEST 8: key is HTML-escaped in the html response
+# A $1 capture is the decoded URI: markup in a purge link must not reflect.
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=esc_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    location ~ ^/purge(/.*) { proxy_cache_purge esc_zone "$1"; }
+--- request
+GET /purge/%3Cscript%3Ealert(%22x%22)%3C/script%3E*
+--- error_code: 202
+--- response_body_like: <p>Key: /&lt;script&gt;alert\(&quot;x&quot;\)&lt;/script&gt;\*</p>
+
+=== TEST 9: key is JSON-escaped in the json response
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=escj_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    cache_purge_response_type json;
+    location ~ ^/purge(/.*) { proxy_cache_purge escj_zone "$1"; }
+--- request
+GET /purge/a%22b%5Cc%01*
+--- error_code: 202
+--- response_body_like: ^\{"Key": "/a\\"b\\\\c\\u0001\*", "Status": "[^"]+"\}$
+
+=== TEST 10: key is escaped in the xml response
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=escx_zone:1m;
+    cache_purge_background_queue on;
+--- config
+    cache_purge_response_type xml;
+    location ~ ^/purge(/.*) { proxy_cache_purge escx_zone "$1"; }
+--- request
+GET /purge/x%5D%5D%3E%3Cy%3E*
+--- error_code: 202
+--- response_body_like: <Key>/x\]\]&gt;&lt;y&gt;\*</Key>

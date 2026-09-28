@@ -193,7 +193,7 @@ static const char ngx_http_cache_purge_body_templ_html[] =
     "<p>Key: %s</p><p>Status: %s</p></center></body></html>";
 static const char ngx_http_cache_purge_body_templ_xml[] =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-    "<status><Key><![CDATA[%s]]></Key><Status>%s</Status></status>";
+    "<status><Key>%s</Key><Status>%s</Status></status>";
 static const char ngx_http_cache_purge_body_templ_text[] =
     "Key: %s\nStatus: %s\n";
 
@@ -8934,6 +8934,108 @@ next:
 
 /* -- response builder --------------------------------------------------- */
 
+/*
+ * The key as the response body may carry it: it comes from the request
+ * (a $1 capture is the decoded URI), so it is escaped for html, xml and
+ * json -- a <script> in a purge link must not reach the browser as markup,
+ * a quote must not end the JSON string.  JSON escapes control characters;
+ * html and xml drop them (XML 1.0 cannot carry them even as entities).
+ * NUL is dropped everywhere: the result is NUL-terminated for the %s in
+ * the templates.
+ */
+static ngx_int_t
+ngx_http_cache_purge_escape_key(ngx_pool_t *pool, ngx_str_t *key,
+    ngx_uint_t type, ngx_str_t *out)
+{
+    u_char      *p, *d, c;
+    size_t       len;
+    ngx_uint_t   pass;
+
+    static u_char  hex[] = "0123456789abcdef";
+
+    d = NULL;
+    len = 0;
+    out->data = NULL;
+
+    for (pass = 0; pass < 2; pass++) {
+
+        for (p = key->data; p < key->data + key->len; p++) {
+            c = *p;
+
+            if (c == '\0') {
+                continue;
+            }
+
+            if (type == NGX_CACHE_PURGE_RESPONSE_TYPE_TEXT) {
+                if (d) { *d++ = c; } else { len++; }
+                continue;
+            }
+
+            if (type == NGX_CACHE_PURGE_RESPONSE_TYPE_JSON) {
+
+                if (c == '"' || c == '\\') {
+                    if (d) { *d++ = '\\'; *d++ = c; } else { len += 2; }
+
+                } else if (c < 0x20 || c == 0x7f) {
+                    if (d) {
+                        d = ngx_cpymem(d, "\\u00", 4);
+                        *d++ = hex[c >> 4];
+                        *d++ = hex[c & 0xf];
+
+                    } else {
+                        len += 6;
+                    }
+
+                } else {
+                    if (d) { *d++ = c; } else { len++; }
+                }
+
+                continue;
+            }
+
+            /* html, xml */
+
+            if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+                continue;
+            }
+
+            switch (c) {
+            case '<':
+                if (d) { d = ngx_cpymem(d, "&lt;", 4); } else { len += 4; }
+                break;
+            case '>':
+                if (d) { d = ngx_cpymem(d, "&gt;", 4); } else { len += 4; }
+                break;
+            case '&':
+                if (d) { d = ngx_cpymem(d, "&amp;", 5); } else { len += 5; }
+                break;
+            case '"':
+                if (d) { d = ngx_cpymem(d, "&quot;", 6); } else { len += 6; }
+                break;
+            case '\'':
+                if (d) { d = ngx_cpymem(d, "&#39;", 5); } else { len += 5; }
+                break;
+            default:
+                if (d) { *d++ = c; } else { len++; }
+            }
+        }
+
+        if (d == NULL) {
+            out->data = ngx_pnalloc(pool, len + 1);
+            if (out->data == NULL) {
+                return NGX_ERROR;
+            }
+
+            d = out->data;
+        }
+    }
+
+    *d = '\0';
+    out->len = d - out->data;
+
+    return NGX_OK;
+}
+
 ngx_int_t
 ngx_http_cache_purge_send_response(ngx_http_request_t *r, ngx_str_t *status)
 {
@@ -8943,19 +9045,13 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r, ngx_str_t *status)
     ngx_str_t                       *key;
     ngx_int_t                        rc;
     size_t                           body_len;
-    u_char                          *buf, *buf_keydata;
+    u_char                          *buf;
+    ngx_str_t                        ekey;
     const char                      *resp_ct,   *resp_body;
     size_t                           resp_ct_size, resp_body_size;
 
     cplcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
     key   = r->cache->keys.elts;
-
-    buf_keydata = ngx_pcalloc(r->pool, key[0].len + 1);
-    if (buf_keydata == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    ngx_memcpy(buf_keydata, key[0].data, key[0].len);
-    /* buf_keydata[key[0].len] is already '\0' from ngx_pcalloc */
 
     switch (cplcf->response_type) {
     case NGX_CACHE_PURGE_RESPONSE_TYPE_JSON:
@@ -8997,17 +9093,24 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r, ngx_str_t *status)
      *   body_len = sizeof(template)
      *              - 1           (NUL terminator is not sent on the wire)
      *              - (2 * 2)     (two "%s" markers consumed, not emitted)
-     *              + key[0].len  (first  %s expansion)
+     *              + ekey.len    (first  %s expansion, escaped key)
      *              + status->len (second %s expansion)
      *
-     * Simplified: (resp_body_size - 5) + key.len + status.len
+     * Simplified: (resp_body_size - 5) + ekey.len + status.len
      *
      * ngx_snprintf writes exactly body_len bytes without a NUL terminator
      * (it stops at buf + max, exclusive).  buf is ngx_pcalloc'd to
      * body_len + 1 so the trailing zero from calloc is there for any code
      * that treats buf as a C string, but it is never sent over the wire.
      */
-    body_len = (resp_body_size - 1 - 4) + key[0].len + status->len;
+    if (ngx_http_cache_purge_escape_key(r->pool, &key[0],
+                                        cplcf->response_type, &ekey)
+        != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    body_len = (resp_body_size - 1 - 4) + ekey.len + status->len;
 
     r->headers_out.content_type.len  = resp_ct_size - 1;
     r->headers_out.content_type.data = (u_char *) resp_ct;
@@ -9018,7 +9121,7 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r, ngx_str_t *status)
     }
 
     /* ngx_snprintf never returns NULL */
-    ngx_snprintf(buf, body_len, resp_body, buf_keydata, status->data);
+    ngx_snprintf(buf, body_len, resp_body, ekey.data, status->data);
 
     r->headers_out.status           = (r->headers_out.status == NGX_HTTP_ACCEPTED)
                                       ? NGX_HTTP_ACCEPTED : NGX_HTTP_OK;
