@@ -3549,7 +3549,8 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s, int *dir_fd,
             fd = openat(*dir_fd, de->d_name,
                         O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
             if (fd == -1) {
-                if (ngx_errno != NGX_ENOENT) {
+                /* ELOOP: swapped for a symlink since readdir, not ours */
+                if (ngx_errno != NGX_ENOENT && ngx_errno != NGX_ELOOP) {
                     s->errors++;
 
                     if (ngx_errno == NGX_EMFILE || ngx_errno == NGX_ENFILE) {
@@ -5051,7 +5052,8 @@ ngx_http_cache_purge_reader_run(void *data, ngx_log_t *log)
             fd = ngx_http_cache_purge_open_file(dir_fd, (char *) name.data);
 
             if (fd == -1) {
-                if (ngx_errno != NGX_ENOENT) {
+                /* ELOOP: swapped for a symlink since readdir, not ours */
+                if (ngx_errno != NGX_ENOENT && ngx_errno != NGX_ELOOP) {
                     s->errors++;
 
                     if (ngx_errno == NGX_EMFILE || ngx_errno == NGX_ENFILE) {
