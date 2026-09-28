@@ -533,6 +533,9 @@ struct ngx_http_cache_purge_io_s {
     void                  (*done)(ngx_http_cache_purge_io_t *io);
     void                   *owner;
     ngx_flag_t              busy;           /* in a thread */
+    /* the op's time limit if it runs inline, cleared if it goes to a thread
+     * (which must not ngx_time_update); NULL for ops without one */
+    ngx_msec_t             *deadline;
 #if (NGX_THREADS)
     ngx_thread_task_t      *task;
 #endif
@@ -4711,6 +4714,9 @@ ngx_http_cache_purge_io_start(ngx_http_cache_purge_io_t *io, ngx_pool_t *pool,
 {
 #if (NGX_THREADS)
     ngx_thread_task_t  *task;
+    ngx_msec_t          deadline;
+
+    deadline = (io->deadline != NULL) ? *io->deadline : 0;
 
     if (ngx_cache_purge_thread_pool != NULL
         && ngx_cache_purge_tasks < ngx_cache_purge_tasks_max
@@ -4723,6 +4729,10 @@ ngx_http_cache_purge_io_start(ngx_http_cache_purge_io_t *io, ngx_pool_t *pool,
         task = io->task;
 
         if (task != NULL) {
+            if (io->deadline != NULL) {
+                *io->deadline = 0;
+            }
+
             task->ctx           = io->data;
             task->handler       = io->handler;
             task->event.data    = io;
@@ -4735,6 +4745,11 @@ ngx_http_cache_purge_io_start(ngx_http_cache_purge_io_t *io, ngx_pool_t *pool,
                 io->busy = 1;
                 ngx_cache_purge_tasks++;
                 return NGX_AGAIN;
+            }
+
+            /* not posted: runs inline after all, within its time limit */
+            if (io->deadline != NULL) {
+                *io->deadline = deadline;
             }
         }
     }
@@ -5198,6 +5213,7 @@ ngx_http_cache_purge_del_start(ngx_http_cache_purge_del_t *del,
     del->ul.n        = del->n;
     del->io.handler  = ngx_http_cache_purge_unlink_run;
     del->io.data     = &del->ul;
+    del->io.deadline = NULL;
 
     return ngx_http_cache_purge_io_start(&del->io, pool, log);
 }
@@ -6126,6 +6142,7 @@ ngx_http_cache_purge_slot_setup(ngx_http_cache_purge_slot_t *slot,
 
     slot->io.handler = ngx_http_cache_purge_reader_run;
     slot->io.data    = rd;
+    slot->io.deadline = &rd->deadline;
     slot->io.done    = ngx_http_cache_purge_slot_io_done;
     slot->io.owner   = slot;
 
@@ -6230,9 +6247,13 @@ ngx_http_cache_purge_slot_run(ngx_http_cache_purge_slot_t *slot)
             return NGX_AGAIN;
 
         case NGX_CACHE_PURGE_SLOT_READ:
-            /* inline reads keep to the slice; the thread pool's need not */
-            slot->rd.deadline = (ngx_cache_purge_tasks_max == 0
-                                 && ngx_cache_purge_conf != NULL
+            /*
+             * Inline reads keep to the slice; the thread pool's need not.
+             * Inline also when a pool is set but this worker has its tasks
+             * in flight already, or the pool queue is full: io_start
+             * clears the limit only for an op it posts to a thread.
+             */
+            slot->rd.deadline = (ngx_cache_purge_conf != NULL
                                  && ngx_cache_purge_conf->walk_budget != 0)
                                 ? ngx_current_msec
                                   + ngx_cache_purge_conf->walk_budget
