@@ -9537,14 +9537,18 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return NGX_HTTP_NOT_FOUND;
     }
 
+    /* the callers return what this returns as the content handler's rc:
+     * HTTP codes, not NGX_DECLINED (the static handler would answer) or
+     * NGX_ERROR (the connection would be closed) */
     if (ngx_http_complex_value(r, u->conf->cache_value, &val) != NGX_OK) {
-        return NGX_ERROR;
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     if (val.len == 0
         || (val.len == 3 && ngx_strncmp(val.data, "off", 3) == 0))
     {
-        return NGX_DECLINED;
+        /* no cache for this request: nothing to purge */
+        return NGX_HTTP_NOT_FOUND;
     }
 
     caches = u->caches->elts;
@@ -9562,7 +9566,7 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "ngx_cache_purge: cache zone \"%V\" not found", &val);
 
-    return NGX_ERROR;
+    return NGX_HTTP_NOT_FOUND;
 }
 # endif
 
@@ -9602,8 +9606,17 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
         return NGX_ERROR;
     }
 
+    /*
+     * How much of the file ngx_http_file_cache_open reads for the header.
+     * Nodes the cache loader made carry no body_start, and a file whose
+     * header is longer than this is "too long" and not found: the upstream
+     * sizes it like nginx does (proxy_buffer_size...); the separate
+     * location syntax has no upstream, so the most a cache file can hold.
+     */
     r->cache      = c;
-    c->body_start = ngx_pagesize;
+    c->body_start = (r->upstream != NULL && r->upstream->conf != NULL)
+                    ? ngx_max(r->upstream->conf->buffer_size, ngx_pagesize)
+                    : 65535;
     c->file_cache = cache;
     c->file.log   = r->connection->log;
 

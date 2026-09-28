@@ -643,3 +643,64 @@ static t25
 [200, 200, 412]
 --- no_error_log
 [alert]
+
+=== TEST 27: PURGE where the cache is off for the request answers 404
+# proxy_cache $variable evaluating to "" or "off": cache_get used to return
+# NGX_DECLINED, and the static handler then answered the PURGE with 405.
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       $arg_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location /origin {
+        return 200 "ok";
+    }
+--- request
+PURGE /cache/t27
+--- error_code: 404
+
+=== TEST 28: cache an entry whose header is longer than a page
+--- http_config eval: $::HttpConfig
+--- config eval
+'
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1h;
+        proxy_buffer_size 8k;
+    }
+    location /origin {
+        add_header X-Big1 "' . ('b' x 3000) . '";
+        add_header X-Big2 "' . ('b' x 3000) . '";
+        return 200 "big";
+    }
+'
+--- request
+GET /cache/t28
+--- error_code: 200
+
+=== TEST 29: exact purge of a long-header entry the new nginx has not seen
+# A node made from the file (no body_start) was read with a page-sized
+# buffer: "cache file has too long header", and the purge found nothing.
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1h;
+        proxy_buffer_size 8k;
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location /origin {
+        return 200 "big";
+    }
+--- request
+PURGE /cache/t28
+--- error_code: 200
+--- no_error_log
+too long header
