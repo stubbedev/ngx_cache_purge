@@ -3125,8 +3125,10 @@ ngx_http_purge_file_cache_delete_exact_file(ngx_tree_ctx_t *ctx,
         return NGX_OK;
     }
 
+    /* ngx_walk_tree opens every name: no symlink out, no FIFO to block on */
     ngx_memzero(&file, sizeof(ngx_file_t));
-    file.fd = ngx_open_file(path->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    file.fd = open((char *) path->data,
+                   O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
     if (file.fd == NGX_INVALID_FILE) {
         return NGX_OK;
     }
@@ -3560,7 +3562,12 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s, int *dir_fd,
 static int
 ngx_http_cache_purge_open_file(int dir_fd, const char *name)
 {
-    static int   open_flags = O_RDONLY|O_CLOEXEC
+    /*
+     * readdir said DT_REG, but the name may be swapped before the open:
+     * a symlink is not followed out of the cache, and a FIFO does not
+     * block the thread (or the event loop) that opens it.
+     */
+    static int   open_flags = O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK
 #  ifdef O_NOATIME
                               |O_NOATIME
 #  endif
