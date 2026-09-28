@@ -131,3 +131,27 @@ qr/"tasks=0" must be between 1 and 64/
 --- request
 GET /health
 --- error_code: 200
+
+=== TEST 8: an entry whose cache key is empty is purged, not skipped
+# An empty key ($arg_v unset) was taken for a key copy that failed: the
+# indexed purge_all skipped its file and still answered purged.
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache {
+        proxy_pass http://backend/origin;
+        proxy_cache idx_zone;
+        proxy_cache_key "$arg_v";
+        proxy_cache_valid 200 1h;
+        proxy_cache_purge PURGE purge_all from 127.0.0.1;
+        add_header X-Cache $upstream_cache_status;
+    }
+    location /origin {
+        return 200 "ok";
+    }
+--- request eval
+["GET /cache/e", "GET /cache/e", "PURGE /cache/e", "GET /cache/e"]
+--- response_headers_like eval
+["X-Cache: MISS", "X-Cache: HIT", "", "X-Cache: MISS"]
+--- error_code eval
+[200, 200, 200, 200]
+--- wait: 0.5

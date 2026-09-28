@@ -5095,7 +5095,7 @@ ngx_http_cache_purge_del_start(ngx_http_cache_purge_del_t *del,
         del->hits[i].keep   = 0;
         del->hits[i].stored = 0;
         /* an entry whose key could not be copied cannot be found again */
-        del->hits[i].rc = (del->index && del->hits[i].key.len == 0)
+        del->hits[i].rc = (del->index && del->hits[i].key.data == NULL)
                           ? NGX_CACHE_PURGE_RC_SKIP
                           : NGX_CACHE_PURGE_RC_FAILED;
     }
@@ -5272,10 +5272,13 @@ ngx_http_cache_purge_index_collect(ngx_http_cache_purge_index_sh_t *sh,
 
         ngx_memcpy(hits[i].md5, n->md5, NGX_HTTP_CACHE_KEY_LEN);
 
-        hits[i].key.data = ngx_pnalloc(pool, n->len);
+        /* data NULL: the copy failed.  An empty cache key ("" from an
+         * unset variable) is a key like any other, not a failed copy. */
+        hits[i].key.data = (n->len > 0) ? ngx_pnalloc(pool, n->len)
+                                        : (u_char *) "";
         hits[i].key.len  = (hits[i].key.data != NULL) ? n->len : 0;
 
-        if (hits[i].key.data != NULL) {
+        if (hits[i].key.data != NULL && n->len > 0) {
             ngx_memcpy(hits[i].key.data, n->key, n->len);
         }
 
@@ -5593,7 +5596,7 @@ ngx_http_cache_purge_index_purge(ngx_http_request_t *r,
     cap   = ngx_min(cmcf->index_sync_limit, NGX_CACHE_PURGE_INDEX_TAKE);
 
     while (more && taken < cmcf->index_sync_limit
-           && hits[taken - 1].key.len != 0)
+           && hits[taken - 1].key.data != NULL)
     {
         if (taken == cap) {
             /* more than a batch: room for all it may take */
@@ -5851,7 +5854,7 @@ ngx_http_cache_purge_index_pass(ngx_http_cache_purge_pass_t *pass,
         pass->files_checked += n;
 
         /* the cursor before del_start sorts the batch by directory */
-        if (n > 0 && pass->hits[n - 1].key.len > 0) {
+        if (n > 0 && pass->hits[n - 1].key.data != NULL) {
             pass->cursor.key.len = pass->hits[n - 1].key.len;
             ngx_memcpy(pass->cursor_key, pass->hits[n - 1].key.data,
                        pass->cursor.key.len);
