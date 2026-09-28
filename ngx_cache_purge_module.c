@@ -135,6 +135,9 @@
 #define NGX_CACHE_PURGE_INTERRUPTED          1
 #define NGX_CACHE_PURGE_FAILED               2
 
+/* a queued purge whose passes kept killing their worker is dropped */
+#define NGX_CACHE_PURGE_CRASHES_MAX          3
+
 /* an index pass's deletion batch */
 #define NGX_CACHE_PURGE_DEL_NONE             0
 #define NGX_CACHE_PURGE_DEL_RUNNING          1
@@ -240,6 +243,9 @@ struct ngx_http_cache_purge_queue_item_s {
      * often it happened */
     ngx_msec_t                         not_before;
     ngx_uint_t                         attempts;
+    /* passes that died with it: it is then taken alone, and dropped after
+     * NGX_CACHE_PURGE_CRASHES_MAX */
+    ngx_uint_t                         crashes;
 };
 
 /*
@@ -1864,15 +1870,16 @@ ngx_http_cache_purge_queue_unhash(ngx_http_cache_purge_queue_t *queue,
 }
 
 /*
- * Take the oldest item of its lane out of the queue: the queue and each lane
- * are in enqueue order, so the head of the queue heads its lane too, and a
- * pass only ever takes lane heads.  An empty lane is freed.  Locked.
+ * Take an item out of the queue and its lane.  Mostly the lane head; a pass
+ * steps over items still waiting out a backoff, so not always.  An empty
+ * lane is freed.  Locked.
  */
 static void
 ngx_http_cache_purge_queue_take(ngx_http_cache_purge_queue_t *queue,
     ngx_http_cache_purge_queue_item_t *item)
 {
-    ngx_http_cache_purge_queue_lane_t  *lane, **lp;
+    ngx_http_cache_purge_queue_lane_t   *lane, **lp;
+    ngx_http_cache_purge_queue_item_t  **ip, *prev;
 
     if (item->prev != NULL) {
         item->prev->next = item->next;
@@ -1891,7 +1898,20 @@ ngx_http_cache_purge_queue_take(ngx_http_cache_purge_queue_t *queue,
     ngx_http_cache_purge_queue_unhash(queue, item);
 
     lane = item->lane;
-    lane->head = item->lnext;
+    prev = NULL;
+
+    for (ip = &lane->head; *ip != NULL; ip = &(*ip)->lnext) {
+        if (*ip == item) {
+            *ip = item->lnext;
+            break;
+        }
+
+        prev = *ip;
+    }
+
+    if (lane->tail == item) {
+        lane->tail = prev;
+    }
 
     if (lane->head == NULL) {
         lane->tail = NULL;
@@ -2066,8 +2086,8 @@ ngx_http_cache_purge_queue_reclaim(ngx_http_cache_purge_queue_t *queue,
 
     n = 0;
 
-    /* the list is newest first: restoring each at the head leaves the
-     * oldest in front */
+    /* each goes to the tail with a backoff: a dead worker's batch is not
+     * the next thing tried */
     for (pp = &queue->taken; *pp != NULL; /* void */ ) {
         item = *pp;
 
@@ -2085,14 +2105,35 @@ ngx_http_cache_purge_queue_reclaim(ngx_http_cache_purge_queue_t *queue,
         item->tnext = NULL;
         item->owner = 0;
 
-        ngx_http_cache_purge_queue_restore(queue, item, 0, log);
+        /*
+         * The worker may have died of this very purge: put back straight
+         * away and at the head, a purge that crashes it would crash the
+         * next one within the second, for good.  It backs off like a
+         * failed pass, is taken alone from now on (so the others of its
+         * batch go through), and is given up after a few deaths.
+         */
+        if (++item->crashes >= NGX_CACHE_PURGE_CRASHES_MAX) {
+            ngx_log_error(NGX_LOG_CRIT, log, 0,
+                          "ngx_cache_purge: purge of \"%V\" key \"%V\" "
+                          "dropped: %ui workers died while carrying it out",
+                          &item->cache_path, &item->key_partial,
+                          item->crashes);
+            ngx_http_cache_purge_queue_item_free(queue, item);
+            n++;
+            continue;
+        }
+
+        ngx_http_cache_purge_queue_restore(queue, item,
+            ngx_min((ngx_msec_t) 1000 << ngx_min(item->attempts, 9),
+                    (ngx_msec_t) 300000),
+            log);
         n++;
     }
 
     if (n > 0) {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "ngx_cache_purge: %ui purge(s) of a worker that died "
-                      "while carrying them out queued again", n);
+                      "while carrying them out queued again (or dropped)", n);
     }
 }
 
@@ -2150,6 +2191,13 @@ ngx_http_cache_purge_pass_release(ngx_http_cache_purge_pass_t *pass,
  * after a build waits for the build to be over.  Queue locked.
  */
 static ngx_flag_t
+ngx_http_cache_purge_item_waiting(ngx_http_cache_purge_queue_item_t *item)
+{
+    return item->not_before != 0
+           && (ngx_msec_int_t) (item->not_before - ngx_current_msec) > 0;
+}
+
+static ngx_flag_t
 ngx_http_cache_purge_lane_ready(ngx_cycle_t *cycle,
     ngx_http_cache_purge_main_conf_t *cmcf,
     ngx_http_cache_purge_queue_item_t *item)
@@ -2157,12 +2205,6 @@ ngx_http_cache_purge_lane_ready(ngx_cycle_t *cycle,
     ngx_http_file_cache_t            *cache;
     ngx_http_cache_purge_index_t     *ix;
     ngx_http_cache_purge_index_sh_t  *sh;
-
-    if (item->not_before != 0
-        && (ngx_msec_int_t) (item->not_before - ngx_current_msec) > 0)
-    {
-        return 0;
-    }
 
     if (item->mode != NGX_CACHE_PURGE_MODE_AFTER_BUILD) {
         return 1;
@@ -2265,8 +2307,11 @@ ngx_http_cache_purge_pass_start(ngx_cycle_t *cycle,
     first = NULL;
     skip  = NULL;
 
+    /* a backoff is the item's own, a build the whole lane's */
     for (item = queue->head; item != NULL; item = item->next) {
-        if (item->lane == skip) {
+        if (item->lane == skip
+            || ngx_http_cache_purge_item_waiting(item))
+        {
             continue;
         }
 
@@ -2298,6 +2343,15 @@ ngx_http_cache_purge_pass_start(ngx_cycle_t *cycle,
          item = next)
     {
         next = item->lnext;
+
+        if (ngx_http_cache_purge_item_waiting(item)) {
+            continue;
+        }
+
+        /* one that was in a pass when its worker died goes alone */
+        if (n > 0 && (item->crashes > 0 || pass->shm_items[0]->crashes > 0)) {
+            break;
+        }
 
         it = ngx_array_push(&pass->items);
         if (it == NULL) {
