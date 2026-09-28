@@ -724,7 +724,7 @@ static ssize_t ngx_http_cache_purge_read_key_fd(int fd, u_char *buf,
 static ngx_int_t ngx_http_cache_purge_scan(ngx_http_cache_purge_scan_t *s,
     ngx_msec_t budget);
 static ngx_uint_t ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
-    ngx_http_file_cache_t *cache, ngx_str_t *pattern);
+    ngx_http_file_cache_t *cache, ngx_str_t *pattern, ngx_uint_t *errors);
 static ngx_int_t ngx_http_cache_purge_index_purge(ngx_http_request_t *r,
     ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all);
 static ngx_int_t ngx_http_cache_purge_index_pass(
@@ -837,7 +837,7 @@ ngx_int_t  ngx_http_cache_purge_init(ngx_http_request_t *r,
                ngx_http_complex_value_t *cache_key);
 void       ngx_http_cache_purge_handler(ngx_http_request_t *r);
 ngx_int_t  ngx_http_file_cache_purge(ngx_http_request_t *r);
-void       ngx_http_cache_purge_all(ngx_http_request_t *r,
+ngx_int_t  ngx_http_cache_purge_all(ngx_http_request_t *r,
                ngx_http_file_cache_t *cache);
 ngx_uint_t ngx_http_cache_purge_partial(ngx_http_request_t *r,
                ngx_http_file_cache_t *cache);
@@ -3590,10 +3590,7 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s, int *dir_fd,
     return NGX_DONE;
 }
 
-/*
- * Read up to size bytes of the KEY: line of dir_fd/name into buf.  Returns
- * the byte count read (the key may be followed by "\n" and headers), or -1.
- */
+/* Open cache file dir_fd/name for reading its key; -1 on failure */
 static int
 ngx_http_cache_purge_open_file(int dir_fd, const char *name)
 {
@@ -3668,6 +3665,11 @@ ngx_http_cache_purge_read_key_fd(int fd, u_char *buf, size_t size)
     return n - sizeof(hdr);
 }
 
+/*
+ * Read up to size bytes of the key of dir_fd/name into buf.  Returns the
+ * byte count read (the key may be followed by "\n" and headers), 0 if it
+ * is not a cache file, or -1.
+ */
 static ssize_t
 ngx_http_cache_purge_read_key(int dir_fd, const char *name, u_char *buf,
     size_t size)
@@ -3757,13 +3759,19 @@ ngx_http_cache_purge_scan(ngx_http_cache_purge_scan_t *s, ngx_msec_t budget)
 }
 
 /* A whole walk, synchronously, for one wildcard (or purge_all when pattern
- * is empty).  Returns the number of files deleted. */
+ * is empty).  Returns the number of files deleted; *errors, if given, is
+ * set when some of the cache (or all of it) could not be read. */
 static ngx_uint_t
 ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
-    ngx_http_file_cache_t *cache, ngx_str_t *pattern)
+    ngx_http_file_cache_t *cache, ngx_str_t *pattern, ngx_uint_t *errors)
 {
     ngx_http_cache_purge_scan_t  s;
     ngx_str_t                    pat;
+    ngx_int_t                    rc;
+
+    if (errors != NULL) {
+        *errors = 1;
+    }
 
     ngx_memzero(&s, sizeof(ngx_http_cache_purge_scan_t));
     s.log   = r->connection->log;
@@ -3777,14 +3785,28 @@ ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
     }
     ngx_memcpy(pat.data, pattern->data, pattern->len);
 
-    if (ngx_http_cache_purge_patterns_init(&s.pats, &pat, 1, s.log) != NGX_OK
-        || ngx_http_cache_purge_scan_open(&s, &cache->path->name) != NGX_OK)
+    if (ngx_http_cache_purge_patterns_init(&s.pats, &pat, 1, s.log) != NGX_OK)
     {
+        return 0;
+    }
+
+    rc = ngx_http_cache_purge_scan_open(&s, &cache->path->name);
+
+    if (rc != NGX_OK) {
+        /* NGX_DECLINED: no cache directory yet, so nothing cached */
+        if (errors != NULL && rc == NGX_DECLINED) {
+            *errors = 0;
+        }
+
         return 0;
     }
 
     (void) ngx_http_cache_purge_scan(&s, 0);
     ngx_http_cache_purge_scan_close(&s);
+
+    if (errors != NULL) {
+        *errors = s.errors;
+    }
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "ngx_cache_purge: walk of \"%V\" checked %ui file(s), "
@@ -8247,13 +8269,15 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
     }
 
     if (cplcf->conf->purge_all) {
-        ngx_http_cache_purge_all(r, cache);
-        /* purge_all empties the zone -- always report 200 regardless of
-         * how many files existed.  Skip ngx_http_cache_purge_handler()
-         * so we never attempt an exact-key lookup on a bulk operation. */
+        /* purge_all empties the zone -- 200 however many files existed,
+         * 500 if some of it could not be read.  Skip
+         * ngx_http_cache_purge_handler() so we never attempt an exact-key
+         * lookup on a bulk operation. */
+        rc = ngx_http_cache_purge_all(r, cache);
         r->main->count++;
-        ngx_http_finalize_request(r,
-            ngx_http_cache_purge_send_response(r, &status));
+        ngx_http_finalize_request(r, (rc == NGX_OK)
+            ? ngx_http_cache_purge_send_response(r, &status)
+            : NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_DONE;
     }
 
@@ -8632,10 +8656,11 @@ ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r)
     }
 
     if (cplcf->conf->purge_all) {
-        ngx_http_cache_purge_all(r, cache);
+        rc = ngx_http_cache_purge_all(r, cache);
         r->main->count++;
-        ngx_http_finalize_request(r,
-            ngx_http_cache_purge_send_response(r, &status));
+        ngx_http_finalize_request(r, (rc == NGX_OK)
+            ? ngx_http_cache_purge_send_response(r, &status)
+            : NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_DONE;
     }
 
@@ -8857,10 +8882,11 @@ ngx_http_scgi_cache_purge_handler(ngx_http_request_t *r)
     }
 
     if (cplcf->conf->purge_all) {
-        ngx_http_cache_purge_all(r, cache);
+        rc = ngx_http_cache_purge_all(r, cache);
         r->main->count++;
-        ngx_http_finalize_request(r,
-            ngx_http_cache_purge_send_response(r, &status));
+        ngx_http_finalize_request(r, (rc == NGX_OK)
+            ? ngx_http_cache_purge_send_response(r, &status)
+            : NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_DONE;
     }
 
@@ -9106,10 +9132,11 @@ ngx_http_uwsgi_cache_purge_handler(ngx_http_request_t *r)
     }
 
     if (cplcf->conf->purge_all) {
-        ngx_http_cache_purge_all(r, cache);
+        rc = ngx_http_cache_purge_all(r, cache);
         r->main->count++;
-        ngx_http_finalize_request(r,
-            ngx_http_cache_purge_send_response(r, &status));
+        ngx_http_finalize_request(r, (rc == NGX_OK)
+            ? ngx_http_cache_purge_send_response(r, &status)
+            : NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_DONE;
     }
 
@@ -9762,12 +9789,16 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
 
 /* -- bulk walk helpers -------------------------------------------------- */
 
-void
+/* NGX_ERROR: some of the cache could not be read, so it is not empty */
+ngx_int_t
 ngx_http_cache_purge_all(ngx_http_request_t *r, ngx_http_file_cache_t *cache)
 {
-    ngx_str_t  all = ngx_null_string;
+    ngx_str_t   all = ngx_null_string;
+    ngx_uint_t  errors;
 
-    (void) ngx_http_cache_purge_scan_sync(r, cache, &all);
+    (void) ngx_http_cache_purge_scan_sync(r, cache, &all, &errors);
+
+    return errors ? NGX_ERROR : NGX_OK;
 }
 
 ngx_uint_t
@@ -9784,7 +9815,7 @@ ngx_http_cache_purge_partial(ngx_http_request_t *r,
         pattern.len--;
     }
 
-    return ngx_http_cache_purge_scan_sync(r, cache, &pattern);
+    return ngx_http_cache_purge_scan_sync(r, cache, &pattern, NULL);
 }
 
 ngx_int_t
