@@ -18,6 +18,9 @@ our $HttpConfig = qq{
 
 $ENV{TEST_NGINX_SERVROOT} = server_root();
 no_long_string();
+# in file order: TEST 29 and 37 purge what TEST 28 and 36 cached with
+# another nginx (Test::Nginx shuffles blocks otherwise)
+no_shuffle();
 run_tests();
 
 __DATA__
@@ -832,3 +835,43 @@ cache zone "nosuch" not found
 --- request
 PURGE /cache/x
 --- error_code: 200
+
+=== TEST 36: cache another entry whose header is longer than a page
+--- http_config eval: $::HttpConfig
+--- config eval
+'
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1h;
+        proxy_buffer_size 8k;
+        add_header X-Cache $upstream_cache_status;
+    }
+    location /origin {
+        add_header X-Big1 "' . ('b' x 3000) . '";
+        add_header X-Big2 "' . ('b' x 3000) . '";
+        return 200 "big";
+    }
+'
+--- request eval
+["GET /cache/t36", "GET /cache/t36"]
+--- response_headers_like eval
+["X-Cache: MISS", "X-Cache: HIT"]
+--- error_code eval
+[200, 200]
+
+=== TEST 37: separate syntax purges it, sized by its own proxy_buffer_size
+# No upstream there: the header read is sized by the purge location's
+# proxy_buffer_size, like the inline syntax is by the proxied one's.
+--- http_config eval: $::HttpConfig
+--- config
+    location ~ ^/sep(/.*)$ {
+        proxy_buffer_size 8k;
+        proxy_cache_purge cache_zone "/cache$1";
+    }
+--- request
+PURGE /sep/t36
+--- error_code: 200
+--- no_error_log
+too long header

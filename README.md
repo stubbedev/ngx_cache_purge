@@ -139,6 +139,14 @@ location (typically a regex location capturing the cache key). Looks up the
 cache zone by name and purges the compiled key expression. This form is
 incompatible with `proxy_cache` and `proxy_pass` in the same location.
 
+An exact purge reads the cached response's headers, as much of them as
+`proxy_buffer_size` allows, like nginx does when it serves the entry: the
+inline form uses the proxied location's, the separate-location form its own.
+If cached headers can be larger than a page (4k or 8k), set
+`proxy_buffer_size` in the separate purge location to the size the proxied
+location uses; an entry whose headers do not fit is otherwise not found
+("cache file ... has too long header" in the error log).
+
 
 ### `fastcgi_cache_purge`
 

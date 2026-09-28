@@ -8638,6 +8638,12 @@ ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r)
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
+        /* no upstream here: this location's proxy_buffer_size, like the
+         * inline syntax (a page unless it is set) */
+        plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+        r->cache->body_start = ngx_max(plcf->upstream.buffer_size,
+                                       (size_t) ngx_pagesize);
+
     } else {
         /* Inline syntax (proxy_cache_purge METHOD from ...): use plcf->upstream
          * as before. */
@@ -9661,14 +9667,17 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
     /*
      * How much of the file ngx_http_file_cache_open reads for the header.
      * Nodes the cache loader made carry no body_start, and a file whose
-     * header is longer than this is "too long" and not found: the upstream
-     * sizes it like nginx does (proxy_buffer_size...); the separate
-     * location syntax has no upstream, so the most a cache file can hold.
+     * header is longer than this is "too long" and not found: sized like
+     * nginx sizes it, from the upstream's buffer_size (proxy_buffer_size,
+     * fastcgi_buffer_size...).  The separate location syntax has no
+     * upstream and sets it from its location after this.  Not the most a
+     * header can be (64k): that buffer on every purge measured ~15% of the
+     * purge rate.
      */
     r->cache      = c;
     c->body_start = (r->upstream != NULL && r->upstream->conf != NULL)
                     ? ngx_max(r->upstream->conf->buffer_size, ngx_pagesize)
-                    : 65535;
+                    : ngx_pagesize;
     c->file_cache = cache;
     c->file.log   = r->connection->log;
 

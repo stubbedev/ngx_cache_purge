@@ -134,8 +134,18 @@ GET /health
 
 === TEST 8: an entry whose cache key is empty is purged, not skipped
 # An empty key ($arg_v unset) was taken for a key copy that failed: the
-# indexed purge_all skipped its file and still answered purged.
---- http_config eval: $::HttpConfig
+# indexed purge_all skipped its file and still answered purged.  A cache of
+# its own: other blocks' entries would make the purge_all asynchronous.
+--- http_config eval
+"    proxy_cache_path " . Cwd::cwd() . "/cache_empty_" . $$ . " levels=1:2 keys_zone=idx_zone:10m inactive=60m use_temp_path=off;
+    cache_purge_background_queue  on;
+    cache_purge_throttle_ms       10ms;
+    cache_purge_index             4m;
+    cache_purge_index_sync_limit  64;
+    upstream backend {
+        server 127.0.0.1:" . Test::Nginx::Util::server_port() . ";
+    }
+"
 --- config
     location /cache {
         proxy_pass http://backend/origin;
