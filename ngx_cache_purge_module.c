@@ -3707,11 +3707,17 @@ ngx_http_cache_purge_index_of_cache(ngx_http_cache_purge_main_conf_t *cmcf,
     return NULL;
 }
 
-/* The index of ix; under the lock it is current, unlocked only a hint */
+/*
+ * The index of ix; under the lock it is current, unlocked only a hint.
+ * Read once: unlocked, a caller that checked for NULL must use the value
+ * it checked, not read the pointer again.
+ */
 static ngx_http_cache_purge_index_sh_t *
 ngx_http_cache_purge_index_peek(ngx_http_cache_purge_index_t *ix)
 {
-    return (ix->shpool != NULL) ? ix->shpool->data : NULL;
+    return (ix->shpool != NULL)
+           ? *(ngx_http_cache_purge_index_sh_t * volatile *) &ix->shpool->data
+           : NULL;
 }
 
 /* Locked (fresh or reset pool) */
@@ -3772,9 +3778,18 @@ ngx_http_cache_purge_index_locked(ngx_http_cache_purge_index_t *ix)
                           &ix->cache_zone->shm.name);
         }
 
+        /*
+         * shpool->data keeps the old root until create replaces it: the
+         * unlocked readers (header filter, drainer hints) may be between a
+         * NULL check and the read, and the old root stays readable memory
+         * of the zone.  Published as NULL only if even the root failed.
+         */
         ngx_slab_init(shpool);
-        shpool->data = NULL;
         sh = ngx_http_cache_purge_index_create(shpool, generation);
+
+        if (sh == NULL) {
+            shpool->data = NULL;
+        }
     }
 
     return sh;
@@ -4282,9 +4297,9 @@ ngx_http_cache_purge_index_record(ngx_http_request_t *r,
      * keep the cleanup -- if the file is stored after a rebuild has walked
      * past its directory, the cleanup adds the entry then.
      */
-    if (ngx_http_cache_purge_index_peek(ix)->state
-        == NGX_CACHE_PURGE_INDEX_FAILED)
-    {
+    sh = ngx_http_cache_purge_index_peek(ix);
+
+    if (sh == NULL || sh->state == NGX_CACHE_PURGE_INDEX_FAILED) {
         p->failed = 1;
         return;
     }
