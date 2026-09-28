@@ -1281,13 +1281,29 @@ ngx_http_cache_purge_queue_lock(ngx_http_cache_purge_main_conf_t *cmcf)
 
     queue = shpool->data;
 
-    if (queue != NULL && queue->busy) {
-        generation = queue->generation + 1;
+    /*
+     * No queue at all: a process was killed inside a reset, between
+     * ngx_slab_init and queue_create.  Left alone it would refuse every
+     * purge (429) and stop the drainer until a restart.
+     */
+    if (queue == NULL || queue->busy) {
 
-        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
-                      "ngx_cache_purge: a process died while updating the "
-                      "purge queue; resetting it, %ui queued purge(s) lost",
-                      queue->size);
+        if (queue != NULL) {
+            generation = queue->generation + 1;
+
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "ngx_cache_purge: a process died while updating "
+                          "the purge queue; resetting it, %ui queued "
+                          "purge(s) lost", queue->size);
+
+        } else {
+            /* not known: a bump that items of the lost queue cannot match */
+            generation = (ngx_uint_t) ngx_pid << 16 ^ ngx_current_msec;
+
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "ngx_cache_purge: a process died while resetting "
+                          "the purge queue; creating it again");
+        }
 
         ngx_slab_init(shpool);
         shpool->data = NULL;
