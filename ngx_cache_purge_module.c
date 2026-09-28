@@ -716,6 +716,8 @@ static void ngx_http_cache_purge_scan_close(ngx_http_cache_purge_scan_t *s);
 static ngx_int_t ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s,
     int *dir_fd, ngx_str_t *name);
 static int ngx_http_cache_purge_open_file(int dir_fd, const char *name);
+static ssize_t ngx_http_cache_purge_read_key_fd(int fd, u_char *buf,
+    size_t size);
 static ngx_int_t ngx_http_cache_purge_scan(ngx_http_cache_purge_scan_t *s,
     ngx_msec_t budget);
 static ngx_uint_t ngx_http_cache_purge_scan_sync(ngx_http_request_t *r,
@@ -3131,9 +3133,8 @@ ngx_http_purge_file_cache_delete_exact_file(ngx_tree_ctx_t *ctx,
     file.log = ctx->log;
 
     /* Read key_len + 1 bytes: the key string followed by its '\n' terminator */
-    n = ngx_read_file(&file, wctx->key_buffer, wctx->key_len + 1,
-                      sizeof(ngx_http_file_cache_header_t)
-                      + NGX_CACHE_PURGE_KEY_HDR_OFFSET);
+    n = ngx_http_cache_purge_read_key_fd(file.fd, wctx->key_buffer,
+                                         wctx->key_len + 1);
     ngx_close_file(file.fd);
 
     if (n != (ngx_int_t)(wctx->key_len + 1)) {
@@ -3582,6 +3583,49 @@ ngx_http_cache_purge_open_file(int dir_fd, const char *name)
 #define NGX_CACHE_PURGE_KEY_OFFSET                                            \
     (sizeof(ngx_http_file_cache_header_t) + NGX_CACHE_PURGE_KEY_HDR_OFFSET)
 
+/*
+ * Up to size bytes of the key of the cache file open at fd, into buf, read
+ * with the header in one call (fd must be at offset 0: freshly opened).
+ * Returns the byte count, -1 on a read error, or 0 when the file is not a
+ * cache file of this nginx: too short, another cache version, or no
+ * "\nKEY: " where the key goes.  nginx does not serve such a file, and its
+ * bytes are not a key to index or match.
+ */
+static ssize_t
+ngx_http_cache_purge_read_key_fd(int fd, u_char *buf, size_t size)
+{
+    ssize_t                        n;
+    struct iovec                   iov[2];
+    u_char                         hdr[NGX_CACHE_PURGE_KEY_OFFSET];
+    ngx_http_file_cache_header_t  *h;
+
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = sizeof(hdr);
+    iov[1].iov_base = buf;
+    iov[1].iov_len  = size;
+
+    n = readv(fd, iov, 2);
+
+    if (n == -1) {
+        return -1;
+    }
+
+    if (n <= (ssize_t) sizeof(hdr)) {
+        return 0;
+    }
+
+    h = (ngx_http_file_cache_header_t *) hdr;
+
+    if (h->version != NGX_HTTP_CACHE_VERSION
+        || ngx_memcmp(hdr + sizeof(ngx_http_file_cache_header_t), "\nKEY: ",
+                      NGX_CACHE_PURGE_KEY_HDR_OFFSET) != 0)
+    {
+        return 0;
+    }
+
+    return n - sizeof(hdr);
+}
+
 static ssize_t
 ngx_http_cache_purge_read_key(int dir_fd, const char *name, u_char *buf,
     size_t size)
@@ -3594,7 +3638,7 @@ ngx_http_cache_purge_read_key(int dir_fd, const char *name, u_char *buf,
         return -1;
     }
 
-    n = pread(fd, buf, size, NGX_CACHE_PURGE_KEY_OFFSET);
+    n = ngx_http_cache_purge_read_key_fd(fd, buf, size);
     (void) close(fd);
 
     return n;
@@ -4949,7 +4993,8 @@ ngx_http_cache_purge_reader_run(void *data, ngx_log_t *log)
             }
 
 #if (NGX_HAVE_POSIX_FADVISE)
-            (void) posix_fadvise(fd, NGX_CACHE_PURGE_KEY_OFFSET, rd->read_len,
+            (void) posix_fadvise(fd, 0,
+                                 NGX_CACHE_PURGE_KEY_OFFSET + rd->read_len,
                                  POSIX_FADV_WILLNEED);
 #endif
 
@@ -4960,8 +5005,8 @@ ngx_http_cache_purge_reader_run(void *data, ngx_log_t *log)
             e = &rd->entries[i];
 
             if (rd->fds[i] != -1) {
-                len = pread(rd->fds[i], e->key, rd->read_len,
-                            NGX_CACHE_PURGE_KEY_OFFSET);
+                len = ngx_http_cache_purge_read_key_fd(rd->fds[i], e->key,
+                                                       rd->read_len);
 
                 if (len == -1) {
                     s->errors++;
