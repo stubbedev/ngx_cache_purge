@@ -358,7 +358,7 @@ typedef struct {
 typedef struct {
     u_char                 *key_partial;
     ngx_uint_t              key_len;
-    u_char                  key_buffer[NGX_CACHE_PURGE_KEY_MAX_LEN];
+    u_char                 *key_buffer;     /* key_len + 1 */
     ngx_uint_t              files_deleted;
     ngx_uint_t              files_checked;
     /*
@@ -3115,14 +3115,33 @@ ngx_http_purge_file_cache_delete_exact_file(ngx_tree_ctx_t *ctx,
     ngx_file_t                       file;
     ngx_int_t                        n;
 
+    u_char                          *p;
+    ngx_uint_t                       i;
+
     wctx = ctx->data;
     wctx->files_checked++;
 
-    /* key_len == 0 or buffer too small to hold key + '\n' terminator: skip */
-    if (wctx->key_len == 0
-        || wctx->key_len + 1 >= NGX_CACHE_PURGE_KEY_MAX_LEN)
-    {
+    if (wctx->key_len == 0) {
         return NGX_OK;
+    }
+
+    /*
+     * Only a cache file: its name is its md5 in hex.  ngx_walk_tree meets
+     * everything, a "<md5>.<n>" temp file too (use_temp_path=off), which
+     * nginx is still writing and would fail to rename into place.
+     */
+    for (p = path->data + path->len; p > path->data && p[-1] != '/'; p--) {
+        /* void */
+    }
+
+    if ((size_t) (path->data + path->len - p) != 2 * NGX_HTTP_CACHE_KEY_LEN) {
+        return NGX_OK;
+    }
+
+    for (i = 0; i < 2 * NGX_HTTP_CACHE_KEY_LEN; i++) {
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) {
+            return NGX_OK;
+        }
     }
 
     /* ngx_walk_tree opens every name: no symlink out, no FIFO to block on */
@@ -3201,6 +3220,12 @@ ngx_http_cache_purge_delete_variants(ngx_http_request_t *r,
     ctx.key_partial = key[0].data;
     ctx.key_len     = key[0].len;
     ctx.cache       = cache;   /* enables shm metadata updates in the walk */
+
+    /* the key and its '\n', whatever its length */
+    ctx.key_buffer = ngx_pnalloc(r->pool, key[0].len + 1);
+    if (ctx.key_buffer == NULL) {
+        return;
+    }
 
     tree.file_handler      = ngx_http_purge_file_cache_delete_exact_file;
     tree.pre_tree_handler  = ngx_http_purge_file_cache_noop;
