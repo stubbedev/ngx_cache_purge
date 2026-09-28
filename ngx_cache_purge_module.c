@@ -6970,10 +6970,18 @@ ngx_http_cache_purge_build_tick(ngx_event_t *ev)
      * With a thread pool the slices are bookkeeping only (#10: no idle time
      * between them).  Inline they read the disk on the event loop, and
      * cache_purge_throttle_ms between slices keeps the worker serving.
+     *
+     * Never 0, though: a timer re-armed from its own handler with 0 is due
+     * at once, and ngx_event_expire_timers runs it again in the same pass
+     * (the handler updates the time) -- the worker would not get back to
+     * epoll until no slot is runnable.  With a pool that is soon, as reads
+     * go to threads; but when they cannot be posted (tasks= in flight, the
+     * pool queue full) they run inline, and a whole build went by without
+     * a request being served.  1 ms lets the event loop in between.
      */
     pause = (runnable && refreshing) ? cmcf->throttle_ms * 20
             : blocked ? 1                /* the lock was busy: soon again */
-            : runnable ? (ngx_cache_purge_tasks_max ? 0 : cmcf->throttle_ms)
+            : runnable ? (ngx_cache_purge_tasks_max ? 1 : cmcf->throttle_ms)
             : waiting ? 1000
             : 200;
 
