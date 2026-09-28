@@ -43,6 +43,25 @@ RUN cd /nginx-src \
     && make install \
     && echo "$SANITIZE" > /usr/local/nginx/SANITIZE
 
+# The same nginx without file AIO (threads only): aio threads reads of the
+# cache header take a code path of their own there (torture s_aio_threads)
+RUN cp -a /nginx-src /nginx-noaio && cd /nginx-noaio \
+    && CC_OPT="-g -O2 -fno-omit-frame-pointer" \
+    && LD_OPT="" \
+    && if [ "$(cat /usr/local/nginx/SANITIZE)" = "asan" ]; then \
+           CC_OPT="-g -O1 -fno-omit-frame-pointer -fsanitize=address"; \
+           LD_OPT="-fsanitize=address"; \
+       fi \
+    && ./configure \
+        --prefix=/usr/local/nginx-noaio \
+        --with-threads \
+        --add-module=/module \
+        --with-cc-opt="$CC_OPT" \
+        --with-ld-opt="$LD_OPT" \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /nginx-noaio
+
 # cachegen: compiled against this nginx's headers, so the cache file header
 # it writes is the one this nginx reads
 COPY t/e2e/tools /e2e/tools

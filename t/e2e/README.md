@@ -122,6 +122,24 @@ disk after every purge:
 | `s_kill_after_202` | kill -9 of every worker right after a queued purge: it is carried out anyway |
 | `s_reset_during_build` | purges during a build, then an index reset: they are carried out after the rebuild |
 | `s_reload_while_locked` | a worker frozen holding the index / queue lock, a reload, then kill -9: the master must not hang |
+| `s_index_reset_window` | a worker stopped in the header filter between its check of the index root and its read of it, while another resets the index: no crash, rebuilt |
+| `s_queue_reset_cut` | a worker killed inside a queue reset, before the queue is created again: purges are still queued (no 429s) and carried out |
+| `s_reclaim` | a queued purge whose pass kills its worker each time: backoff between retries, the rest of its batch carried out, dropped after 3 |
+| `s_resize_reload` | a reload that changes `cache_purge_queue_size` with purges queued: grown, all moved and carried out; same size, untouched; shrunk, the loss logged |
+| `s_purge_all_vs_wildcard` | a purge_all whose request key equals a queued wildcard's: both carried out |
+| `s_bad_files` | files of another cache version, without `KEY:`, junk, a FIFO, a symlink out of the cache, and a name refused with ELOOP: none matched or deleted, the build completes |
+| `s_readdir_eio` | `readdir()` failing with EIO: the build is not complete until it can read the directory; synchronous purge_all answers 500, then 200 |
+| `s_vary_walk` | `cache_purge_vary_aware` with a 600-byte key: every variant removed, a temp file of a fill in progress and other keys left |
+| `s_inline_budget` | a slow disk and a full thread pool, so build reads run inline: requests are still served within the walk budget |
+| `s_aio_threads` | `aio threads` on a build without file AIO (and with): exact purges answer 200 then not-found, never 500 |
+
+The regression scenarios (from `s_index_reset_window` on) have a positive
+half, what must keep working, and a negative half, the failure the fix
+prevents; against the build before the fixes, the negatives fail. Faults
+are injected by `tor_shim.c`, an `LD_PRELOAD` library the scenarios build
+and switch with files in `/tmp/tor` (EIO from `readdir`, ELOOP from
+`openat`, slow key reads). The image carries a second nginx built without
+file AIO, `/usr/local/nginx-noaio`, for `s_aio_threads`.
 
 `t/e2e/torture.sh --seq` hammers the lock-free reads: 12 workers, new keys
 inserted all the time, and GET -> wildcard purge -> GET cycles that must never
