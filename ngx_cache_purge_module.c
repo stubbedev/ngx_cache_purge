@@ -8834,14 +8834,16 @@ ngx_http_cache_purge_access_handler(ngx_http_request_t *r)
     {
         /*
          * Not a purge request.  Forward to the original content handler
-         * if one exists (e.g. proxy_pass), otherwise return 404.
-         * original_handler is NULL when proxy_cache is used without
-         * proxy_pass (cache-only / purge-only location).
+         * if one exists (e.g. proxy_pass), otherwise decline: nginx then
+         * runs the content phase handlers (static, index, try_files) as
+         * it would without us.  original_handler is NULL wherever those
+         * serve the location -- a purge inherited from http{} or server{}
+         * lands on every location, not only the proxied ones.
          */
         if (cplcf->original_handler != NULL) {
             return cplcf->original_handler(r);
         }
-        return NGX_HTTP_NOT_FOUND;
+        return NGX_DECLINED;
     }
 
     if ((cplcf->conf->access || cplcf->conf->access6)

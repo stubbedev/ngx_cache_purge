@@ -599,3 +599,23 @@ no cache configured for this location
 ["inherited", qr/purged/i, qr/412/]
 --- no_error_log
 [alert]
+
+=== TEST 25: static files still served in a location that inherits the purge directive
+# The static handler runs in the content phase, so such a location has no
+# clcf->handler: the access handler used to answer every GET with 404.
+--- http_config eval: $::HttpConfig
+--- config
+    proxy_cache_purge PURGE from 127.0.0.1;
+    location /static {
+        alias html;
+    }
+--- user_files
+>>> index.html
+static t25
+--- request
+GET /static/index.html
+--- error_code: 200
+--- response_body
+static t25
+--- no_error_log
+[alert]
