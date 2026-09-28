@@ -3482,9 +3482,16 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *s, int *dir_fd,
         dir     = s->dirs[s->depth - 1];
         *dir_fd = dirfd(dir);
 
+        ngx_set_errno(0);
         de = readdir(dir);
 
         if (de == NULL) {
+            /* NULL is the end or an error (EIO...): an error means a
+             * directory not read to the end, not a complete one */
+            if (ngx_errno != 0) {
+                s->errors++;
+            }
+
             (void) closedir(dir);
             s->depth--;
             continue;
