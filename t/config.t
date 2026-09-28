@@ -159,3 +159,18 @@ PURGE /purge/test*
 --- error_code: 202
 --- response_headers
 Content-Type: text/xml
+
+=== TEST 7: "purge_all from" with no address list causes config error
+# Used to read past the argument list and fall through to an open purge.
+--- http_config
+    proxy_cache_path $TEST_NGINX_SERVROOT/cache keys_zone=pf_zone:1m;
+--- config
+    location /cache {
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/origin;
+        proxy_cache pf_zone;
+        proxy_cache_key $uri;
+        proxy_cache_purge PURGE purge_all from;
+    }
+--- must_die
+--- error_log eval
+qr/"from" must be followed by "all" or addresses/

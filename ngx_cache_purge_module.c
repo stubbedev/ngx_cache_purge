@@ -9360,6 +9360,13 @@ ngx_http_cache_purge_conf(ngx_conf_t *cf, ngx_http_cache_purge_conf_t *cpcf)
         return NGX_CONF_ERROR;
     }
 
+    /* "purge_all from" with nothing after it: no list, not an open purge */
+    if (from_position + 1 >= cf->args->nelts) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"from\" must be followed by \"all\" or addresses");
+        return NGX_CONF_ERROR;
+    }
+
     if (ngx_strcmp(value[from_position + 1].data, "all") == 0) {
         cpcf->enable = 1;
         return NGX_CONF_OK;
