@@ -3625,45 +3625,60 @@ ngx_http_cache_purge_open_file(int dir_fd, const char *name)
 
 /*
  * Up to size bytes of the key of the cache file open at fd, into buf, read
- * with the header in one call (fd must be at offset 0: freshly opened).
- * Returns the byte count, -1 on a read error, or 0 when the file is not a
- * cache file of this nginx: too short, another cache version, or no
- * "\nKEY: " where the key goes.  nginx does not serve such a file, and its
- * bytes are not a key to index or match.
+ * with the header in one call.  Returns the byte count, -1 on a read
+ * error, or 0 when the file is not a cache file of this nginx: too short,
+ * another cache version, or no "\nKEY: " where the key goes.  nginx does
+ * not serve such a file, and its bytes are not a key to index or match.
+ *
+ * Walks and builds read at most NGX_CACHE_PURGE_KEY_MAX_LEN: one pread
+ * into the stack, as a readv of header and key measured slower on walks.
+ * Only the vary walk reads longer keys, with a readv (fd at offset 0).
  */
 static ssize_t
 ngx_http_cache_purge_read_key_fd(int fd, u_char *buf, size_t size)
 {
     ssize_t                        n;
     struct iovec                   iov[2];
-    u_char                         hdr[NGX_CACHE_PURGE_KEY_OFFSET];
+    u_char                         b[NGX_CACHE_PURGE_KEY_OFFSET
+                                     + NGX_CACHE_PURGE_KEY_MAX_LEN];
     ngx_http_file_cache_header_t  *h;
 
-    iov[0].iov_base = hdr;
-    iov[0].iov_len  = sizeof(hdr);
-    iov[1].iov_base = buf;
-    iov[1].iov_len  = size;
+    if (size <= NGX_CACHE_PURGE_KEY_MAX_LEN) {
+        n = pread(fd, b, NGX_CACHE_PURGE_KEY_OFFSET + size, 0);
 
-    n = readv(fd, iov, 2);
+    } else {
+        iov[0].iov_base = b;
+        iov[0].iov_len  = NGX_CACHE_PURGE_KEY_OFFSET;
+        iov[1].iov_base = buf;
+        iov[1].iov_len  = size;
+
+        n = readv(fd, iov, 2);
+    }
 
     if (n == -1) {
         return -1;
     }
 
-    if (n <= (ssize_t) sizeof(hdr)) {
+    if (n <= (ssize_t) NGX_CACHE_PURGE_KEY_OFFSET) {
         return 0;
     }
 
-    h = (ngx_http_file_cache_header_t *) hdr;
+    h = (ngx_http_file_cache_header_t *) b;
 
     if (h->version != NGX_HTTP_CACHE_VERSION
-        || ngx_memcmp(hdr + sizeof(ngx_http_file_cache_header_t), "\nKEY: ",
+        || ngx_memcmp(b + sizeof(ngx_http_file_cache_header_t), "\nKEY: ",
                       NGX_CACHE_PURGE_KEY_HDR_OFFSET) != 0)
     {
         return 0;
     }
 
-    return n - sizeof(hdr);
+    n -= NGX_CACHE_PURGE_KEY_OFFSET;
+
+    if (size <= NGX_CACHE_PURGE_KEY_MAX_LEN) {
+        ngx_memcpy(buf, b + NGX_CACHE_PURGE_KEY_OFFSET, n);
+    }
+
+    return n;
 }
 
 /*
