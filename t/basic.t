@@ -704,3 +704,28 @@ PURGE /cache/t28
 --- error_code: 200
 --- no_error_log
 too long header
+
+=== TEST 30: a location's own proxy purge wins over a fastcgi purge inherited from server{}
+# The merge took the first enabled protocol, fastcgi, even where the
+# location set proxy_cache_purge itself: no fastcgi cache there, 404.  A
+# separate-syntax location was wrapped by the fastcgi access handler too.
+--- http_config eval: $::HttpConfig . "    fastcgi_cache_path $ENV{TEST_NGINX_SERVROOT}/fcgi_cache keys_zone=fcgi_zone:1m;\n"
+--- config
+    fastcgi_cache_purge PURGE from 127.0.0.1;
+    location /cache {
+        proxy_pass        http://backend/origin;
+        proxy_cache       cache_zone;
+        proxy_cache_key   "$uri";
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE from 127.0.0.1;
+    }
+    location ~ ^/sep(/.*)$ {
+        proxy_cache_purge cache_zone "/cache$1";
+    }
+    location /origin {
+        return 200 "t30";
+    }
+--- request eval
+["GET /cache/t30", "PURGE /cache/t30", "GET /cache/t30b", "PURGE /sep/t30b"]
+--- error_code eval
+[200, 200, 200, 200]

@@ -10025,6 +10025,12 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 # if (NGX_HTTP_UWSGI)
     ngx_flag_t  was_set_uwsgi;
 # endif
+# if (NGX_HTTP_PROXY)
+    ngx_flag_t  separate;
+# endif
+    ngx_http_cache_purge_conf_t  *pick;
+    ngx_http_handler_pt           pick_handler;
+    ngx_flag_t                    pick_set;
 
 # if (NGX_HTTP_FASTCGI)
     was_set_fastcgi = (conf->fastcgi.enable == 1);
@@ -10044,21 +10050,20 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->response_type, prev->response_type,
                               NGX_CACHE_PURGE_RESPONSE_TYPE_HTML);
 
+    /*
+     * All four are merged before one is picked: a nested location inherits
+     * from this one, so each must be complete here -- returning on the
+     * first enabled one left the others unmerged for the levels below.
+     */
 # if (NGX_HTTP_FASTCGI)
     ngx_http_cache_purge_merge_conf(&conf->fastcgi, &prev->fastcgi);
-
-    if (conf->fastcgi.enable) {
-        conf->conf             = &conf->fastcgi;
-        conf->handler          = ngx_http_fastcgi_cache_purge_handler;
-        conf->original_handler = (was_set_fastcgi || !clcf->noname)
-                                 ? clcf->handler
-                                 : prev->original_handler;
-        clcf->handler          = ngx_http_cache_purge_access_handler;
-        return NGX_CONF_OK;
-    }
 # endif
 
 # if (NGX_HTTP_PROXY)
+    /* the separate location syntax of this very location, not inherited */
+    separate = (conf->proxy_separate_zone != NULL
+                || conf->proxy_separate_value != NULL);
+
     if (conf->proxy.enable == NGX_CONF_UNSET
         && conf->proxy_separate_zone == NULL
         && conf->proxy_separate_value == NULL)
@@ -10069,45 +10074,82 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     ngx_http_cache_purge_merge_conf(&conf->proxy, &prev->proxy);
-
-    if (conf->proxy.enable) {
-        conf->conf             = &conf->proxy;
-        conf->handler          = ngx_http_proxy_cache_purge_handler;
-        conf->original_handler = (was_set_proxy || !clcf->noname)
-                                 ? clcf->handler
-                                 : prev->original_handler;
-        clcf->handler          = ngx_http_cache_purge_access_handler;
-        return NGX_CONF_OK;
-    }
 # endif
 
 # if (NGX_HTTP_SCGI)
     ngx_http_cache_purge_merge_conf(&conf->scgi, &prev->scgi);
-
-    if (conf->scgi.enable) {
-        conf->conf             = &conf->scgi;
-        conf->handler          = ngx_http_scgi_cache_purge_handler;
-        conf->original_handler = (was_set_scgi || !clcf->noname)
-                                 ? clcf->handler
-                                 : prev->original_handler;
-        clcf->handler          = ngx_http_cache_purge_access_handler;
-        return NGX_CONF_OK;
-    }
 # endif
 
 # if (NGX_HTTP_UWSGI)
     ngx_http_cache_purge_merge_conf(&conf->uwsgi, &prev->uwsgi);
+# endif
 
-    if (conf->uwsgi.enable) {
-        conf->conf             = &conf->uwsgi;
-        conf->handler          = ngx_http_uwsgi_cache_purge_handler;
-        conf->original_handler = (was_set_uwsgi || !clcf->noname)
+# if (NGX_HTTP_PROXY)
+    /*
+     * "proxy_cache_purge zone key" here: clcf->handler is its purge
+     * handler already, and a purge inherited for another protocol must
+     * not wrap it.
+     */
+    if (separate) {
+        return NGX_CONF_OK;
+    }
+# endif
+
+    /*
+     * The one set in this location wins over one inherited: an inline
+     * fastcgi_cache_purge at server{} level must not take a location's own
+     * proxy_cache_purge (it would look for a fastcgi cache there and 404).
+     * Among equals, the order is fastcgi, proxy, scgi, uwsgi.
+     */
+    pick         = NULL;
+    pick_handler = NULL;
+    pick_set     = 0;
+
+# if (NGX_HTTP_FASTCGI)
+    if (conf->fastcgi.enable && (pick == NULL || (was_set_fastcgi && !pick_set)))
+    {
+        pick         = &conf->fastcgi;
+        pick_handler = ngx_http_fastcgi_cache_purge_handler;
+        pick_set     = was_set_fastcgi;
+    }
+# endif
+
+# if (NGX_HTTP_PROXY)
+    if (conf->proxy.enable && (pick == NULL || (was_set_proxy && !pick_set)))
+    {
+        pick         = &conf->proxy;
+        pick_handler = ngx_http_proxy_cache_purge_handler;
+        pick_set     = was_set_proxy;
+    }
+# endif
+
+# if (NGX_HTTP_SCGI)
+    if (conf->scgi.enable && (pick == NULL || (was_set_scgi && !pick_set)))
+    {
+        pick         = &conf->scgi;
+        pick_handler = ngx_http_scgi_cache_purge_handler;
+        pick_set     = was_set_scgi;
+    }
+# endif
+
+# if (NGX_HTTP_UWSGI)
+    if (conf->uwsgi.enable && (pick == NULL || (was_set_uwsgi && !pick_set)))
+    {
+        pick         = &conf->uwsgi;
+        pick_handler = ngx_http_uwsgi_cache_purge_handler;
+        pick_set     = was_set_uwsgi;
+    }
+# endif
+
+    if (pick != NULL) {
+        conf->conf             = pick;
+        conf->handler          = pick_handler;
+        conf->original_handler = (pick_set || !clcf->noname)
                                  ? clcf->handler
                                  : prev->original_handler;
         clcf->handler          = ngx_http_cache_purge_access_handler;
         return NGX_CONF_OK;
     }
-# endif
 
     ngx_conf_merge_ptr_value(conf->conf, prev->conf, NULL);
 
