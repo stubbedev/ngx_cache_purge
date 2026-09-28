@@ -695,6 +695,8 @@ static ngx_int_t ngx_http_cache_purge_enqueue_raw(
     ngx_uint_t mode);
 static ngx_int_t ngx_http_cache_purge_try_enqueue(ngx_http_request_t *r,
     ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all);
+static void ngx_http_cache_purge_queue_migrate(
+    ngx_http_cache_purge_main_conf_t *cmcf, ngx_shm_zone_t *shm_zone);
 static void ngx_http_cache_purge_pass_end(ngx_http_cache_purge_pass_t *pass);
 static void ngx_http_cache_purge_pass_release(ngx_http_cache_purge_pass_t *pass,
     ngx_flag_t requeue, ngx_log_t *log);
@@ -1346,7 +1348,9 @@ ngx_http_cache_purge_queue_peek(ngx_http_cache_purge_main_conf_t *cmcf)
  * Shared-memory zone initialiser -- called by the master process once per
  * nginx start or live reload.  On a reload the existing queue is kept, so
  * purges queued before it are not lost, and its tunables are refreshed.
- * max_size is not reduced below the current occupancy.
+ * max_size is not reduced below the current occupancy.  A reload that
+ * changes the zone size gets a new zone: queue_migrate carries the purges
+ * over.
  */
 static ngx_int_t
 ngx_http_cache_purge_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
@@ -1381,7 +1385,136 @@ ngx_http_cache_purge_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_ERROR;
     }
 
+    ngx_http_cache_purge_queue_migrate(cmcf, shm_zone);
+
     return NGX_OK;
+}
+
+/*
+ * A reload that changes cache_purge_queue_size changes the zone size, and
+ * nginx then makes a new zone instead of keeping the old one: without this
+ * every purge already answered 202 would be gone.  The old cycle's zone is
+ * still mapped in the master while the new cycle is set up; its purges,
+ * queued and in progress, are queued again in the new one (those in
+ * progress may then run twice: purges are at least once).
+ *
+ * The old workers still use the old zone, so it is locked -- but only
+ * tried: a worker killed holding it is not unlocked while the master
+ * reloads, and waiting for it would hang the reload.
+ */
+static void
+ngx_http_cache_purge_queue_migrate(ngx_http_cache_purge_main_conf_t *cmcf,
+    ngx_shm_zone_t *shm_zone)
+{
+    ngx_http_cache_purge_queue_t       *old, *queue;
+    ngx_http_cache_purge_queue_item_t  *item;
+    ngx_slab_pool_t                    *oshpool;
+    ngx_shm_zone_t                     *oz;
+    ngx_list_part_t                    *part;
+    ngx_uint_t                          i, tries, moved, lost, level;
+
+    if (ngx_cycle == NULL || ngx_cycle->shared_memory.part.elts == NULL) {
+        return;
+    }
+
+    oz   = NULL;
+    part = (ngx_list_part_t *) &ngx_cycle->shared_memory.part;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            i = 0;
+        }
+
+        oz = &((ngx_shm_zone_t *) part->elts)[i];
+
+        if (oz->init == ngx_http_cache_purge_init_shm_zone
+            && oz->shm.name.len == shm_zone->shm.name.len
+            && ngx_strncmp(oz->shm.name.data, shm_zone->shm.name.data,
+                           shm_zone->shm.name.len) == 0
+            && oz->shm.addr != NULL
+            && oz->shm.addr != shm_zone->shm.addr)
+        {
+            break;
+        }
+
+        oz = NULL;
+    }
+
+    if (oz == NULL) {
+        return;
+    }
+
+    oshpool = (ngx_slab_pool_t *) oz->shm.addr;
+
+    for (tries = 0; !ngx_shmtx_trylock(&oshpool->mutex); tries++) {
+        if (tries == 100) {
+            ngx_log_error(NGX_LOG_ALERT, shm_zone->shm.log, 0,
+                          "ngx_cache_purge: the old purge queue is locked; "
+                          "purges queued before the reload are lost");
+            return;
+        }
+
+        ngx_msleep(1);
+    }
+
+    old = oshpool->data;
+
+    if (old == NULL || old->busy) {
+        ngx_shmtx_unlock(&oshpool->mutex);
+        ngx_log_error(NGX_LOG_ALERT, shm_zone->shm.log, 0,
+                      "ngx_cache_purge: the old purge queue was left "
+                      "mid-change by a dead worker; purges queued before "
+                      "the reload are lost");
+        return;
+    }
+
+    moved = 0;
+    lost  = 0;
+
+    for (i = 0; i < 2; i++) {
+        for (item = (i == 0) ? old->taken : old->head;
+             item != NULL;
+             item = (i == 0) ? item->tnext : item->next)
+        {
+            /* the new queue may be smaller: one summary line, not a
+             * "queue full" per purge */
+            queue = cmcf->queue_shpool->data;
+
+            if (queue == NULL || queue->size >= cmcf->queue_size) {
+                lost++;
+                continue;
+            }
+
+            if (ngx_http_cache_purge_enqueue_raw(cmcf, shm_zone->shm.log,
+                                                 &item->cache_path,
+                                                 &item->key_partial,
+                                                 item->purge_all, item->mode)
+                == NGX_OK)
+            {
+                moved++;
+
+            } else {
+                lost++;
+            }
+        }
+    }
+
+    ngx_shmtx_unlock(&oshpool->mutex);
+
+    level = lost ? NGX_LOG_ALERT : NGX_LOG_NOTICE;
+
+    if (moved + lost > 0) {
+        ngx_log_error(level, shm_zone->shm.log, 0,
+                      "ngx_cache_purge: purge queue resized: %ui queued "
+                      "purge(s) moved to the new queue, %ui lost (queue "
+                      "full)", moved, lost);
+    }
 }
 
 

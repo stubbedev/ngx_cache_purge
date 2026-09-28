@@ -206,8 +206,12 @@ batches. Has no effect on exact-key purges, which are always synchronous. When
 disabled, all purges are processed synchronously in the request handler.
 
 A queued purge stays in shared memory until it has been carried out: if the
-worker running it dies (crash, `kill -9`), it is queued again and run by the
-next one; a reload or graceful stop hands it back too. A walk that cannot read
+worker running it dies (crash, `kill -9`), it is queued again after a backoff
+and from then on run on its own, so a purge that kills its worker cannot take
+the rest of its batch down with it; after three such deaths it is dropped
+(`crit`). A reload or graceful stop hands it back too, and a reload that
+changes `cache_purge_queue_size` moves the queued purges into the resized
+queue (`notice`; `alert` with the number lost if the new queue is too small). A walk that cannot read
 some cache directories (out of file descriptors, I/O errors) walks them again,
 in rounds further apart, and queues its purges again if they still fail.
 
