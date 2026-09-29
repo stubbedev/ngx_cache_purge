@@ -47,6 +47,7 @@ http {{
         proxy_cache_valid 200 30d;
         location /cdn/ {{
             add_header X-Cache $upstream_cache_status;
+            {os.environ.get("BENCH_LOC_EXTRA", "")}
             proxy_pass http://origin;
             proxy_cache images;
             proxy_cache_purge PURGE from 127.0.0.1;
